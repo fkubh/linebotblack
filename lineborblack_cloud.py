@@ -296,6 +296,7 @@ def reply_blacklist(event, item, match_type):
     color = item.get("color", "未提供")
     bank_code = item.get("bank_code", "")
     account = item.get("account", "")
+    note = item.get("note", "").strip()
 
     if not phone:
         phone = "未提供"
@@ -321,6 +322,17 @@ def reply_blacklist(event, item, match_type):
         f"顏色：{color}\n"
         f"銀行代碼：{bank_code}\n"
         f"匯款帳號：{account}\n"
+    )
+
+    # 有填備註才顯示
+    if note:
+        reply_text += (
+            f"\n"
+            f"📝 黑名單備註：\n"
+            f"{note}\n"
+        )
+
+    reply_text += (
         f"\n"
         f"🚨 此司機永久禁派 🚨"
     )
@@ -329,7 +341,6 @@ def reply_blacklist(event, item, match_type):
         event.reply_token,
         TextSendMessage(text=reply_text)
     )
-
 
 # =====================================================
 # 回覆特殊註記
