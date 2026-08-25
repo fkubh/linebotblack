@@ -1025,7 +1025,6 @@ def check_plate(text):
 # 電話比對
 # 優先順序 ③
 # =====================================================
-
 def check_phone(text):
 
     # 抓出訊息中的 8～20 位數字
@@ -1037,49 +1036,54 @@ def check_phone(text):
     normalized_numbers = []
 
     for number in numbers:
+        normalized = normalize_phone(number)
 
-    normalized_phone = normalize_phone(phone)
-
-        if normalized_phone in normalized_numbers:
-            return "blacklist", item, "電話"
+        if normalized:
+            normalized_numbers.append(normalized)
 
 
-    # -----------------------------
-    # 黑名單
-    # -----------------------------
+    # =================================================
+    # 黑名單電話比對
+    # =================================================
 
     for item in blocked_list:
 
-        phone = normalize_phone(
-            item.get("phone", "")
-        )
+        phones = item.get("phone", [])
 
-        if not phone:
-            continue
+        # 如果只有一支電話，轉成 list
+        if isinstance(phones, str):
+            phones = [phones]
 
-        if phone in normalized_numbers:
-            return "blacklist", item, "電話"
+        for phone in phones:
+
+            normalized_phone = normalize_phone(phone)
+
+            if normalized_phone in normalized_numbers:
+                return "blacklist", item, "電話"
 
 
-    # -----------------------------
-    # 特殊註記
-    # -----------------------------
+    # =================================================
+    # 特殊註記電話比對
+    # =================================================
 
     for item in special_notes:
 
-        phone = normalize_phone(
-            item.get("phone", "")
-        )
+        phones = item.get("phone", [])
 
-        if not phone:
-            continue
+        # 如果只有一支電話，轉成 list
+        if isinstance(phones, str):
+            phones = [phones]
 
-        if phone in normalized_numbers:
-            return "special", item, "電話"
+        for phone in phones:
+
+            normalized_phone = normalize_phone(phone)
+
+            if normalized_phone in normalized_numbers:
+                return "special", item, "電話"
+
 
     return None
-
-
+    
 # =====================================================
 # 匯款資料比對
 # 優先順序 ④
