@@ -4,7 +4,8 @@ import json
 import time
 
 from google.oauth2 import service_account
-from google.auth.transport.requests import AuthorizedSession
+from google.auth.transport.requests import Request as GoogleAuthRequest
+import requests
 
 from flask import Flask, request, abort
 
@@ -77,7 +78,6 @@ GOOGLE_CREDENTIALS = service_account.Credentials.from_service_account_info(
     GOOGLE_SERVICE_ACCOUNT_INFO,
     scopes=GOOGLE_SCOPES,
 )
-GOOGLE_SESSION = AuthorizedSession(GOOGLE_CREDENTIALS)
 
 # 快取 30 秒：修改試算表後，最慢約 30 秒套用；避免每一則 LINE 訊息都打一次 Google API。
 SHEET_CACHE_SECONDS = int(os.environ.get("SHEET_CACHE_SECONDS", "30"))
@@ -116,7 +116,27 @@ def load_driver_lists(force=False):
         f"{range_name}"
     )
 
-    response = GOOGLE_SESSION.get(url, timeout=10)
+    # 使用 Service Account 取得 OAuth Access Token
+    if not GOOGLE_CREDENTIALS.valid:
+        GOOGLE_CREDENTIALS.refresh(GoogleAuthRequest())
+
+    headers = {
+        "Authorization": f"Bearer {GOOGLE_CREDENTIALS.token}"
+    }
+
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=10
+    )
+
+    if response.status_code != 200:
+        app.logger.error(
+            "Google Sheets API 錯誤 %s：%s",
+            response.status_code,
+            response.text
+        )
+
     response.raise_for_status()
     values = response.json().get("values", [])
 
