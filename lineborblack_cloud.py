@@ -545,7 +545,10 @@ blocked_list = [
     {
         "name": "李玉綸",
         "plate": "RFR-3157",
-        "phone": "0975621975""0933619628",
+        "phone":[
+            "0975621975",
+            "0933619628"
+        ],
         "vehicle": "RAV4",
         "color": "白色",
         "bank_code": "822",
@@ -597,7 +600,10 @@ blocked_list = [
     {
         "name": "呂小七（青陽）",
         "plate": "RDM-0166",
-        "phone": "0985676447""0933061999",
+        "phone":[
+            "0985676447",
+            "0933061999"
+        ],
         "vehicle": "賓士 v250d 八座",
         "color": "銀色",
         "bank_code": "822",
@@ -833,7 +839,7 @@ def normalize_account(value):
 def reply_blacklist(event, item, match_type):
 
     name = item.get("name", "未提供")
-    phone = normalize_phone(item.get("phone", ""))
+    phone = normalize_phone(item.get("phone", []))
     plate = item.get("plate", "")
     vehicle = item.get("vehicle", "未提供")
     color = item.get("color", "未提供")
@@ -881,7 +887,7 @@ def reply_blacklist(event, item, match_type):
 def reply_special_note(event, item, match_type):
 
     name = item.get("name", "未提供")
-    phone = normalize_phone(item.get("phone", ""))
+    phone = normalize_phone(item.get("phone", []))
     plate = item.get("plate", "")
     vehicle = item.get("vehicle", "未提供")
     color = item.get("color", "未提供")
@@ -1032,10 +1038,10 @@ def check_phone(text):
 
     for number in numbers:
 
-        normalized = normalize_phone(number)
+    normalized_phone = normalize_phone(phone)
 
-        if normalized:
-            normalized_numbers.append(normalized)
+        if normalized_phone in normalized_numbers:
+            return "blacklist", item, "電話"
 
 
     # -----------------------------
