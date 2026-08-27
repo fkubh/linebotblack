@@ -13,6 +13,8 @@ time, passenger count and current dispatch state.
 
 from __future__ import annotations
 
+PARSER_VERSION = "V1.5-20260828-fix3"
+
 import argparse
 import html
 import json
