@@ -1,604 +1,194 @@
-"""Airport transfer order summary V1.
-
-Features
-- Parse monthly Google Sheet rows or a local .xlsx export.
-- Build daily summaries grouped into 送機 / 接機 and sorted by time.
-- Keep duplicate order numbers as separate route instances (e.g. A車/B車/C車).
-- Overlay LINE-side dispatch events: assigned / recalled / edited / cancelled / restored.
-- Preserve full event history while showing only the latest compact status in the daily summary.
-
-This module intentionally keeps AI out of deterministic fields such as order number,
-time, passenger count and current dispatch state.
-"""
-
-from __future__ import annotations
-
-import argparse
-import json
+import os
 import re
-import zipfile
-from dataclasses import asdict, dataclass, field, replace
+import json
+import time
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Iterable, Optional
-import xml.etree.ElementTree as ET
+from zoneinfo import ZoneInfo
+from urllib.parse import quote
+
+from order_summary_v1 import (
+    Event, EventStore, generate_daily_summary, parse_line_command, parse_rows, PARSER_VERSION
+)
+
+from google.oauth2 import service_account
+from google.auth.transport.requests import Request as GoogleAuthRequest
+import requests
+
+from flask import Flask, request, abort
+
+from linebot import (
+    LineBotApi,
+    WebhookHandler
+)
+
+from linebot.exceptions import (
+    InvalidSignatureError
+)
+
+from linebot.models import (
+    MessageEvent,
+    TextMessage,
+    TextSendMessage,
+)
 
 
-FIELD_LABELS = [
-    "出發日期", "乘車人數", "行李數量", "航班編號", "上車地點", "下車地點",
-    "其他備註", "聯絡人", "電話", "結算價", "客收", "費用",
-]
-FIELD_RE = re.compile(r"^\s*(%s)\s*[：:]\s*(.*)$" % "|".join(map(re.escape, FIELD_LABELS)))
-ORDER_ID_RE = re.compile(r"\b(?:\d{2}KK\d{9}|ORD\d{10}|[A-Z]{3}\d{6})\b", re.I)
-DATE_RE = re.compile(r"(?<!\d)(\d{1,2})\s*/\s*(\d{1,2})(?!\d)")
-TIME_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3])\s*[:：]\s*([0-5]\d)(?!\d)")
+# =====================================================
+# Flask
+# =====================================================
 
-# Normal districts. For ambiguous compass districts we keep the city prefix when available.
-CITY_PREFIX_RE = re.compile(r"(台北市|臺北市|新北市|桃園市|台中市|臺中市|台南市|臺南市|高雄市|基隆市|新竹市|嘉義市|新竹縣|苗栗縣|彰化縣|南投縣|雲林縣|嘉義縣|屏東縣|宜蘭縣|花蓮縣|台東縣|臺東縣|澎湖縣)([\u4e00-\u9fff]{1,5}?(?:區|鎮|鄉|市))")
-LOCAL_DISTRICT_RE = re.compile(r"([\u4e00-\u9fff]{1,4}(?:區|鎮|鄉))")
-COUNTY_CITY_NAMES = {"竹北市", "苗栗市", "彰化市", "南投市", "斗六市", "太保市", "朴子市", "屏東市", "宜蘭市", "花蓮市", "台東市", "馬公市"}
-AMBIGUOUS_DISTRICTS = {"東區", "西區", "南區", "北區", "中區"}
-FALSE_DISTRICT_SUFFIXES = {"社區", "園區", "校區"}
-INFORMAL_AREA_ALIASES = {
-    "新北市汐止": "汐止區", "新北市八里": "八里區", "新北市板橋": "板橋區",
-    "新北市三重": "三重區", "新北市中和": "中和區", "新北市永和": "永和區",
-    "新北市新莊": "新莊區", "新北市新店": "新店區", "新北市樹林": "樹林區",
-    "新北市淡水": "淡水區", "新北市土城": "土城區", "新北市蘆洲": "蘆洲區",
-    "新北市五股": "五股區", "新北市泰山": "泰山區", "新北市林口": "林口區",
-    "新北市瑞芳": "瑞芳區", "新北市三峽": "三峽區", "新北市鶯歌": "鶯歌區",
-}
+app = Flask(__name__)
 
 
+# =====================================================
+# LINE Bot 設定
+# =====================================================
 
-@dataclass
-class Order:
-    order_id: str
-    instance_key: str
-    source_row: int
-    source_tag: str
-    raw_text: str
-    date: str
-    trip_type: str
-    time: str
-    pax: int
-    pickup: str
-    dropoff: str
-    district_text: str
-    vehicle_tag: str = ""
-    extra_tags: list[str] = field(default_factory=list)
-    flight: str = ""
-    notes: str = ""
+CHANNEL_ACCESS_TOKEN = os.environ.get("CHANNEL_ACCESS_TOKEN")
+
+CHANNEL_SECRET = os.environ.get("CHANNEL_SECRET")
 
 
-@dataclass
-class Event:
-    order_id: str
-    event_type: str
-    at: str
-    driver_name: str = ""
-    plate: str = ""
-    note: str = ""
-    instance_key: str = ""
-    changes: dict[str, str] = field(default_factory=dict)
-
-
-class EventStore:
-    """Simple JSON persistence for V1/local testing.
-
-    On Render, use a persistent disk or later replace this with a Sheet/DB adapter.
-    """
-
-    def __init__(self, path: str | Path):
-        self.path = Path(path)
-        self.events: list[Event] = []
-        self.load()
-
-    def load(self) -> None:
-        if not self.path.exists():
-            self.events = []
-            return
-        data = json.loads(self.path.read_text(encoding="utf-8"))
-        self.events = [Event(**item) for item in data]
-
-    def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps([asdict(e) for e in self.events], ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-    def add(self, event: Event) -> None:
-        self.events.append(event)
-        self.save()
-
-    def for_order(self, order: Order) -> list[Event]:
-        matched = []
-        for event in self.events:
-            if event.order_id.upper() != order.order_id.upper():
-                continue
-            if event.instance_key and event.instance_key != order.instance_key:
-                continue
-            matched.append(event)
-        return sorted(matched, key=lambda e: e.at)
-
-
-def normalize_spaces(text: str) -> str:
-    return re.sub(r"[ \t\u3000]+", " ", (text or "").strip())
-
-
-def parse_fields(raw: str) -> tuple[list[str], dict[str, str]]:
-    """Split header lines and labelled multiline fields."""
-    headers: list[str] = []
-    fields: dict[str, str] = {}
-    current: Optional[str] = None
-
-    for raw_line in (raw or "").replace("\r\n", "\n").split("\n"):
-        line = raw_line.strip()
-        if not line:
-            continue
-        m = FIELD_RE.match(line)
-        if m:
-            current = m.group(1)
-            fields[current] = m.group(2).strip()
-            continue
-        if current:
-            # Stop absorbing data once a common unlabelled payment marker appears.
-            if re.match(r"^(?:★|\*|客收|結算|費用)", line):
-                current = None
-                continue
-            # Numbered pickup/dropoff lines belong to the same field.
-            fields[current] = (fields[current] + "\n" + line).strip()
-        else:
-            headers.append(line)
-    return headers, fields
-
-
-def extract_order_id(raw: str, fallback: str = "") -> str:
-    for source in (raw, fallback):
-        m = ORDER_ID_RE.search(source or "")
-        if m:
-            return m.group(0).upper()
-    # LINE/manual orders may use text as the second column; keep a conservative fallback.
-    fb = normalize_spaces(fallback)
-    return fb if fb and len(fb) <= 40 else ""
-
-
-def extract_date(text: str) -> str:
-    m = DATE_RE.search(text or "")
-    if not m:
-        return ""
-    return f"{int(m.group(1))}/{int(m.group(2))}"
-
-
-def time_hhmm(text: str) -> str:
-    m = TIME_RE.search(text or "")
-    if not m:
-        return ""
-    return f"{int(m.group(1)):02d}{int(m.group(2)):02d}"
-
-
-def detect_trip_type(raw: str, fields: dict[str, str]) -> str:
-    head = raw.splitlines()[0] if raw else ""
-    if "接機" in head or "接機" in raw[:80]:
-        return "接機"
-    if "送機" in head or "送機" in raw[:80]:
-        return "送機"
-    pickup = fields.get("上車地點", "")
-    dropoff = fields.get("下車地點", "")
-    airport_words = r"桃園機場|桃機|TPE|松山機場|機場"
-    if re.search(airport_words, pickup, re.I):
-        return "接機"
-    if re.search(airport_words, dropoff, re.I):
-        return "送機"
-    return ""
-
-
-def detect_time(trip_type: str, fields: dict[str, str]) -> str:
-    dep = fields.get("出發日期", "")
-    flight = fields.get("航班編號", "")
-    # Explicit designated pickup time wins for airport pickup.
-    if trip_type == "接機":
-        m = re.search(r"指定時間\s*([0-2]?\d\s*[:：]\s*[0-5]\d)", dep)
-        if m:
-            return time_hhmm(m.group(1))
-        # Prefer 【HH:MM】, then （HH:MM）/(HH:MM), then any time in flight text.
-        for pattern in [r"【\s*([^】]+)\s*】", r"[（(]\s*([^）)]+)\s*[）)]"]:
-            m = re.search(pattern, flight)
-            if m:
-                t = time_hhmm(m.group(1))
-                if t:
-                    return t
-        return time_hhmm(flight)
-    return time_hhmm(dep)
-
-
-def extract_pax(text: str) -> int:
-    m = re.search(r"(\d+)", text or "")
-    return int(m.group(1)) if m else 0
-
-
-def extract_districts(address: str) -> list[str]:
-    if not address:
-        return []
-    text = address.replace("臺", "台")
-    found: list[str] = []
-    occupied: list[tuple[int, int]] = []
-
-    for phrase, label in INFORMAL_AREA_ALIASES.items():
-        if phrase in text and label not in found:
-            found.append(label)
-
-    # Prefer explicit city/county + district matches first.
-    for m in CITY_PREFIX_RE.finditer(text):
-        city = m.group(1).replace("臺", "台")
-        district = m.group(2)
-        occupied.append(m.span())
-        if district in FALSE_DISTRICT_SUFFIXES:
-            continue
-        if district.endswith("市") and district not in COUNTY_CITY_NAMES:
-            continue
-        label = district
-        # Preserve city for compass districts and 桃園市, matching current dispatch habits.
-        if district in AMBIGUOUS_DISTRICTS or city == "桃園市":
-            label = f"{city}{district}"
-        if label not in found:
-            found.append(label)
-
-    # Then accept standalone district/town/township names, excluding obvious place-name false positives.
-    def overlaps(span: tuple[int, int]) -> bool:
-        return any(not (span[1] <= a or span[0] >= b) for a, b in occupied)
-
-    for m in LOCAL_DISTRICT_RE.finditer(text):
-        if overlaps(m.span()):
-            continue
-        district = m.group(1)
-        if district in FALSE_DISTRICT_SUFFIXES or district.endswith("社區") or district.endswith("園區"):
-            continue
-        # Ignore strings directly ending with 門市/商圈 descriptors before the suffix.
-        prefix = text[max(0, m.start()-4):m.end()]
-        if "門市" in prefix:
-            continue
-        if district not in found:
-            found.append(district)
-
-    # County-administered cities may appear without a county prefix.
-    for name in COUNTY_CITY_NAMES:
-        if name in text and name not in found:
-            found.append(name)
-    return found
-
-
-def district_for_order(trip_type: str, fields: dict[str, str]) -> str:
-    address = fields.get("下車地點", "") if trip_type == "接機" else fields.get("上車地點", "")
-    districts = extract_districts(address)
-    if not districts:
-        return "地區待確認"
-    return "/".join(districts)
-
-
-def vehicle_tag(raw: str) -> str:
-    """Map source vehicle wording to the compact daily-summary label.
-
-    Rules:
-    - 四座 / 經五 / 一般五座: hidden
-    - 休旅 / 休五 -> 休旅
-    - 高五 -> 高五
-    - 經七 / 七座 / 假七 -> 經七
-    - 高七 -> 高七
-    - 阿法 / Alphard -> Alphard
-    - 九座 -> 九座
-    - 高九 -> 高九
-    - 保母車 -> 保母車
-    """
-    head = raw.splitlines()[0].replace(" ", "") if raw else ""
-    head_lower = head.lower()
-
-    # Specific classes first so e.g. 高七 is not swallowed by 七座 rules.
-    if "alphard" in head_lower or "阿法" in head:
-        return "Alphard"
-    if "保母車" in head:
-        return "保母車"
-    if "高九" in head:
-        return "高九"
-    if "九座" in head:
-        return "九座"
-    if "高七" in head:
-        return "高七"
-    if any(x in head for x in ["經七", "七座", "假七"]):
-        return "經七"
-    if "高五" in head:
-        return "高五"
-    if any(x in head for x in ["休旅", "休五"]):
-        return "休旅"
-
-    # 四座 / 經五 / 五座 deliberately omitted from the compact summary.
-    return ""
-
-
-def extra_tags(fields: dict[str, str]) -> list[str]:
-    """Tags that belong inside 【】. 舉牌 is intentionally excluded.
-
-    增高墊 synonyms -> 增高墊
-    child/infant safety-seat synonyms -> 安椅
-    """
-    notes = fields.get("其他備註", "")
-    tags: list[str] = []
-
-    booster_pattern = r"前向式安全座椅[（(]?增高[）)]?|增高墊|兒童增高墊"
-    seat_pattern = r"嬰兒座椅|兒童安全座椅|向後式嬰兒安全座椅|向後式座椅|前向式安全座椅|安全座椅|汽座"
-
-    # Booster wording has precedence over the generic 安全座椅 wording.
-    scrubbed = notes
-    if re.search(booster_pattern, notes, re.I):
-        tags.append("增高墊")
-        scrubbed = re.sub(booster_pattern, "", scrubbed, flags=re.I)
-    if re.search(seat_pattern, scrubbed, re.I):
-        tags.append("安椅")
-    return tags
-
-
-def external_markers(order: Order) -> str:
-    """Markers shown outside 【】 according to dispatch rules.
-
-    - 舉牌 -> *舉牌*
-    - 松山機場 -> *(松機)
-    - 指定時間 -> *指定時間*
-    """
-    markers: list[str] = []
-    full_text = "\n".join([order.raw_text, order.pickup, order.dropoff, order.notes])
-    if "舉牌" in order.notes:
-        markers.append("*舉牌*")
-    if re.search(r"松山機場|台北松山機場|臺北松山機場", full_text):
-        markers.append("*(松機)")
-    if "指定時間" in full_text:
-        markers.append("*指定時間*")
-    return "".join(markers)
-
-
-def parse_order_row(row: list[str], row_number: int) -> Optional[Order]:
-    raw = next((str(v) for v in row if "出發日期" in str(v) and "乘車人數" in str(v)), "")
-    if not raw:
-        return None
-    headers, fields = parse_fields(raw)
-    fallback_id = str(row[1]).strip() if len(row) > 1 else ""
-    oid = extract_order_id(raw, fallback_id)
-    if not oid:
-        # Keep LINE/manual rows addressable using their first non-field header.
-        oid = fallback_id or next((h for h in headers if h), f"ROW{row_number}")
-    trip = detect_trip_type(raw, fields)
-    date = extract_date(fields.get("出發日期", ""))
-    source_tag = str(row[3]).strip() if len(row) > 3 else ""
-    instance_key = f"{oid}#{source_tag}" if source_tag else f"{oid}#R{row_number}"
-    return Order(
-        order_id=oid,
-        instance_key=instance_key,
-        source_row=row_number,
-        source_tag=source_tag,
-        raw_text=raw,
-        date=date,
-        trip_type=trip,
-        time=detect_time(trip, fields),
-        pax=extract_pax(fields.get("乘車人數", "")),
-        pickup=fields.get("上車地點", ""),
-        dropoff=fields.get("下車地點", ""),
-        district_text=district_for_order(trip, fields),
-        vehicle_tag=vehicle_tag(raw),
-        extra_tags=extra_tags(fields),
-        flight=fields.get("航班編號", ""),
-        notes=fields.get("其他備註", ""),
+if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
+    raise RuntimeError(
+        "缺少 LINE 環境變數：請設定 CHANNEL_ACCESS_TOKEN 與 CHANNEL_SECRET"
     )
 
 
-def parse_rows(rows: Iterable[list[str]]) -> list[Order]:
-    result: list[Order] = []
-    for idx, row in enumerate(rows, start=1):
-        order = parse_order_row(row, idx)
-        if order:
-            result.append(order)
-    return result
+line_bot_api = LineBotApi(
+    CHANNEL_ACCESS_TOKEN
+)
+
+handler = WebhookHandler(
+    CHANNEL_SECRET
+)
+
+# =====================================================
+# Google Sheet 司機資料
+# =====================================================
+
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+GOOGLE_SHEET_TAB = os.environ.get("GOOGLE_SHEET_TAB", "drivers")
+
+if not GOOGLE_SHEET_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
+    raise RuntimeError(
+        "缺少 Google Sheet 環境變數：請設定 GOOGLE_SHEET_ID 與 GOOGLE_SERVICE_ACCOUNT_JSON"
+    )
+
+try:
+    GOOGLE_SERVICE_ACCOUNT_INFO = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+except json.JSONDecodeError as exc:
+    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON 不是有效的 JSON") from exc
+
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+GOOGLE_CREDENTIALS = service_account.Credentials.from_service_account_info(
+    GOOGLE_SERVICE_ACCOUNT_INFO,
+    scopes=GOOGLE_SCOPES,
+)
+
+# =====================================================
+# 訂單每日簡表 V1
+# =====================================================
+# 訂單可使用另一份 Google Sheet；若未設定則停用簡表功能，不影響原本司機黑名單功能。
+ORDER_SHEET_ID = os.environ.get("ORDER_SHEET_ID", "").strip()
+ORDER_EVENTS_PATH = os.environ.get("ORDER_EVENTS_PATH", "order_events_v1.json")
+ORDER_SHEET_MAX_COL = os.environ.get("ORDER_SHEET_MAX_COL", "H")
+ORDER_SHEET_TAB_TEMPLATE = os.environ.get("ORDER_SHEET_TAB_TEMPLATE", "{year}/{month}月")
+ORDER_SHOW_UNASSIGNED = os.environ.get("ORDER_SHOW_UNASSIGNED", "false").lower() in {"1", "true", "yes", "on"}
+order_event_store = EventStore(ORDER_EVENTS_PATH)
 
 
-def parse_change_note(note: str) -> dict[str, str]:
-    """Parse deterministic correction fields from a LINE edit note.
-
-    Examples:
-      時間=11:40 人數=3
-      航班延誤 10:25→11:40
-      地區=大安區 車型=休旅
-      日期=8/29
-    """
-    text = normalize_spaces(note)
-    changes: dict[str, str] = {}
-
-    # Explicit key=value wins.
-    patterns = {
-        "time": r"(?:時間|接機時間|送機時間)\s*[=＝:]\s*([0-2]?\d(?::?[0-5]\d)?)",
-        "pax": r"(?:人數|乘車人數)\s*[=＝:]\s*(\d+)",
-        "district": r"(?:地區|區域)\s*[=＝:]\s*([^ ]+)",
-        "vehicle_tag": r"(?:車型|車種)\s*[=＝:]\s*([^ ]+)",
-        "date": r"(?:日期|出發日期)\s*[=＝:]\s*(\d{1,2}/\d{1,2})",
-        "trip_type": r"(?:類型|接送)\s*[=＝:]\s*(接機|送機)",
-    }
-    for key, pattern in patterns.items():
-        m = re.search(pattern, text)
-        if m:
-            changes[key] = m.group(1)
-
-    # Common human shorthand: 10:25→11:40 / 1025->1140.
-    arrows = re.findall(r"([0-2]?\d(?::?[0-5]\d)?)\s*(?:→|->|＞|>)\s*([0-2]?\d(?::?[0-5]\d)?)", text)
-    if arrows and "time" not in changes:
-        changes["time"] = arrows[-1][1]
-
-    if "time" in changes:
-        raw = changes["time"].replace(":", "")
-        if raw.isdigit():
-            changes["time"] = raw.zfill(4)
-    if "date" in changes:
-        changes["date"] = extract_date(changes["date"])
-    if "vehicle_tag" in changes:
-        v = changes["vehicle_tag"]
-        vl = v.lower()
-        if "alphard" in vl or "阿法" in v:
-            changes["vehicle_tag"] = "Alphard"
-        elif "保母車" in v:
-            changes["vehicle_tag"] = "保母車"
-        elif "高九" in v:
-            changes["vehicle_tag"] = "高九"
-        elif "九座" in v:
-            changes["vehicle_tag"] = "九座"
-        elif "高七" in v:
-            changes["vehicle_tag"] = "高七"
-        elif any(x in v for x in ["經七", "七座", "假七"]):
-            changes["vehicle_tag"] = "經七"
-        elif "高五" in v:
-            changes["vehicle_tag"] = "高五"
-        elif "休旅" in v or "休五" in v:
-            changes["vehicle_tag"] = "休旅"
-        elif v in {"無", "一般", "經五", "五座", "四座"}:
-            changes["vehicle_tag"] = ""
-    return changes
+def _taipei_now_iso():
+    return datetime.now(ZoneInfo("Asia/Taipei")).isoformat(timespec="minutes")
 
 
-def effective_order(order: Order, events: list[Event]) -> Order:
-    """Overlay all LINE correction events without mutating the Google Sheet source order."""
-    patch: dict[str, Any] = {}
-    for e in events:
-        if e.event_type.lower() != "edited":
-            continue
-        changes = dict(e.changes or {})
-        if not changes and e.note:
-            changes = parse_change_note(e.note)
-        if "time" in changes:
-            patch["time"] = changes["time"]
-        if "pax" in changes:
-            try:
-                patch["pax"] = int(changes["pax"])
-            except (TypeError, ValueError):
-                pass
-        if "district" in changes:
-            patch["district_text"] = changes["district"]
-        if "vehicle_tag" in changes:
-            patch["vehicle_tag"] = changes["vehicle_tag"]
-        if "date" in changes and changes["date"]:
-            patch["date"] = changes["date"]
-        if "trip_type" in changes:
-            patch["trip_type"] = changes["trip_type"]
-    return replace(order, **patch) if patch else order
+def _sheet_values(spreadsheet_id, range_name):
+    if not GOOGLE_CREDENTIALS.valid:
+        GOOGLE_CREDENTIALS.refresh(GoogleAuthRequest())
+    headers = {"Authorization": f"Bearer {GOOGLE_CREDENTIALS.token}"}
+    # A1 range 可能包含 /、空白、中文等字元，因此整段做 URL encode。
+    encoded_range = quote(range_name, safe="")
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
+        f"{encoded_range}"
+    )
+    response = requests.get(url, headers=headers, timeout=15)
+    if response.status_code != 200:
+        app.logger.error("訂單 Google Sheets API 錯誤 %s：%s", response.status_code, response.text)
+    response.raise_for_status()
+    return response.json().get("values", [])
 
 
-def status_for(order: Order, events: list[Event]) -> tuple[str, dict[str, Any]]:
-    state: dict[str, Any] = {
-        "cancelled": False,
-        "assigned": False,
-        "driver_name": "",
-        "plate": "",
-        "assigned_count": 0,
-        "recall_count": 0,
-        "edit_count": 0,
-    }
-    for e in events:
-        et = e.event_type.lower()
-        if et == "assigned":
-            state["assigned"] = True
-            state["driver_name"] = e.driver_name
-            state["plate"] = e.plate
-            state["assigned_count"] += 1
-            state["cancelled"] = False
-        elif et in {"recalled", "unassigned"}:
-            state["assigned"] = False
-            state["driver_name"] = ""
-            state["plate"] = ""
-            state["recall_count"] += 1
-        elif et == "edited":
-            state["edit_count"] += 1
-        elif et == "cancelled":
-            state["cancelled"] = True
-            state["assigned"] = False
-        elif et == "restored":
-            state["cancelled"] = False
+def _resolve_order_sheet_date(date_text):
+    """支援 M/D 與 YYYY/M/D；未填年份時使用台北目前年份。"""
+    full = re.search(r"(?<!\d)(20\d{2})\s*/\s*(\d{1,2})\s*/\s*(\d{1,2})(?!\d)", date_text)
+    if full:
+        return int(full.group(1)), int(full.group(2)), int(full.group(3))
 
-    if state["cancelled"]:
-        return "取消", state
-    reassigned = state["assigned"] and state["assigned_count"] >= 2 and state["recall_count"] >= 1
-    edited = state["edit_count"] > 0
-    if reassigned and edited:
-        return "異動・重派・已派", state
-    if reassigned:
-        return "重派・已派", state
-    if edited and state["assigned"]:
-        return "異動・已派", state
-    if edited:
-        return "異動・未派", state
-    if state["assigned"]:
-        return "已派", state
-    return "未派", state
+    short = re.search(r"(?<!\d)(\d{1,2})\s*/\s*(\d{1,2})(?!\d)", date_text)
+    if not short:
+        raise ValueError("日期格式請輸入 M/D，例如：簡表 8/28；也可輸入 YYYY/M/D")
+
+    year = datetime.now(ZoneInfo("Asia/Taipei")).year
+    return year, int(short.group(1)), int(short.group(2))
 
 
-def compact_tags(order: Order) -> str:
-    tags = []
-    if order.vehicle_tag:
-        tags.append(order.vehicle_tag)
-    tags.extend(order.extra_tags)
-    return f"【{'+'.join(tags)}】" if tags else ""
+def load_orders_for_date(date_text):
+    if not ORDER_SHEET_ID:
+        raise RuntimeError("尚未設定 ORDER_SHEET_ID")
+
+    year, month, day = _resolve_order_sheet_date(date_text)
+    tab_name = ORDER_SHEET_TAB_TEMPLATE.format(year=year, month=month, day=day)
+
+    # 分頁名稱含 / 時，A1 notation 必須用單引號包起來，例如：'2026/8月'!A:H
+    range_name = f"'{tab_name}'!A:{ORDER_SHEET_MAX_COL}"
+    app.logger.info("讀取訂單分頁：%s", tab_name)
+    rows = _sheet_values(ORDER_SHEET_ID, range_name)
+    return parse_rows(rows)
 
 
-def summary_line(order: Order, status: str, show_unassigned: bool = False) -> str:
-    time_text = order.time or "????"
-    pax = f"{order.pax}人" if order.pax else "?人"
-    route = f"接{order.district_text}" if order.trip_type == "接機" else f"{order.district_text}送"
-    tags = compact_tags(order)
-    markers = external_markers(order)
-    status_text = ""
-    if status != "未派" or show_unassigned:
-        status_text = f"【{status}】"
-    source_tag = f"({order.source_tag})" if order.source_tag else ""
-    return f"{time_text} {pax} {route}{tags}-{order.order_id}{source_tag}{markers}{status_text}"
-
-
-def generate_daily_summary(
-    orders: list[Order],
-    target_date: str,
-    event_store: Optional[EventStore] = None,
-    include_cancelled: bool = True,
-    show_unassigned: bool = False,
-) -> str:
-    target = extract_date(target_date) or target_date.strip()
-    selected: list[tuple[Order, list[Event]]] = []
-    for base_order in orders:
-        events = event_store.for_order(base_order) if event_store else []
-        order = effective_order(base_order, events)
-        if order.date == target:
-            selected.append((order, events))
-    selected.sort(key=lambda pair: (pair[0].trip_type != "送機", pair[0].time or "9999", pair[0].order_id, pair[0].instance_key))
-
-    groups = {"送機": [], "接機": []}
-    for order, events in selected:
-        status, _ = status_for(order, events)
-        if status == "取消" and not include_cancelled:
-            continue
-        groups.setdefault(order.trip_type or "其他", []).append(summary_line(order, status, show_unassigned))
-
-    out = [target, ""]
-    for group_name in ["送機", "接機", "其他"]:
-        lines = groups.get(group_name, [])
-        if not lines:
-            continue
-        out.append(group_name)
-        out.extend(lines)
-        out.append("")
-    return "\n".join(out).rstrip()
-
-
-def event_history_text(order: Order, store: EventStore) -> str:
-    events = store.for_order(order)
-    status, state = status_for(order, events)
-    lines = [f"{order.order_id}｜目前：{status}"]
-    if state.get("driver_name"):
-        lines.append(f"司機：{state['driver_name']} {state.get('plate','')}".rstrip())
-    lines.append(f"異動 {state['edit_count']} 次／指派 {state['assigned_count']} 次／拉回 {state['recall_count']} 次")
+def order_history_by_id(order_id):
+    events = [e for e in order_event_store.events if e.order_id.upper() == order_id.upper()]
+    events.sort(key=lambda e: e.at)
     if not events:
-        lines.append("尚無 LINE 調度事件")
-        return "\n".join(lines)
+        return f"{order_id}\n尚無調度／異動紀錄"
+    assigned = 0
+    recalled = 0
+    edited = 0
+    cancelled = False
+    active_driver = ""
+    active_plate = ""
+    for e in events:
+        if e.event_type == "assigned":
+            assigned += 1
+            active_driver, active_plate = e.driver_name, e.plate
+            cancelled = False
+        elif e.event_type in {"recalled", "unassigned"}:
+            recalled += 1
+            active_driver = active_plate = ""
+        elif e.event_type == "edited":
+            edited += 1
+        elif e.event_type == "cancelled":
+            cancelled = True
+            active_driver = active_plate = ""
+        elif e.event_type == "restored":
+            cancelled = False
+    if cancelled:
+        current = "取消"
+    elif active_driver or active_plate:
+        current = "重派・已派" if assigned >= 2 and recalled >= 1 else "已派"
+        if edited:
+            current = "異動・" + current
+    elif edited:
+        current = "異動・未派"
+    else:
+        current = "未派"
+    lines = [
+        f"{order_id}｜目前：{current}",
+        f"異動 {edited} 次／指派 {assigned} 次／拉回 {recalled} 次",
+    ]
+    if active_driver or active_plate:
+        lines.append(f"目前司機：{active_driver} {active_plate}".rstrip())
     lines.append("")
     for e in events:
         detail = " ".join(x for x in [e.driver_name, e.plate, e.note] if x)
@@ -606,114 +196,859 @@ def event_history_text(order: Order, store: EventStore) -> str:
     return "\n".join(lines)
 
 
-# -----------------------------
-# Minimal XLSX reader (stdlib only)
-# -----------------------------
-XLSX_NS = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+def _split_line_text(text, max_chars=4800):
+    """依換行切 LINE 長文字，避免直接截斷造成訂單看起來像漏抓。"""
+    text = str(text or "")
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    current = []
+    current_len = 0
+    for line in text.splitlines():
+        add_len = len(line) + (1 if current else 0)
+        if current and current_len + add_len > max_chars:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = len(line)
+        elif len(line) > max_chars:
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                current_len = 0
+            for start in range(0, len(line), max_chars):
+                chunks.append(line[start:start + max_chars])
+        else:
+            current.append(line)
+            current_len += add_len
+    if current:
+        chunks.append("\n".join(current))
+    return [c for c in chunks if c]
 
 
-def _xlsx_colnum(ref: str) -> int:
-    m = re.match(r"([A-Z]+)", ref)
-    n = 0
-    for ch in m.group(1):
-        n = n * 26 + ord(ch) - 64
-    return n
+def _line_source_target_id(event):
+    """取得群組 / 聊天室 / 個人 push target。"""
+    source = getattr(event, "source", None)
+    if source is None:
+        return ""
+    return (
+        getattr(source, "group_id", "")
+        or getattr(source, "room_id", "")
+        or getattr(source, "user_id", "")
+        or ""
+    )
 
 
-def load_rows_from_xlsx(path: str | Path, sheet_name: str) -> list[list[str]]:
-    with zipfile.ZipFile(path) as z:
-        shared: list[str] = []
-        if "xl/sharedStrings.xml" in z.namelist():
-            root = ET.fromstring(z.read("xl/sharedStrings.xml"))
-            for si in root.findall("a:si", XLSX_NS):
-                shared.append("".join((t.text or "") for t in si.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t")))
+def handle_order_v1_command(event, text):
+    cmd = parse_line_command(text)
+    if not cmd:
+        return False
 
-        workbook = ET.fromstring(z.read("xl/workbook.xml"))
-        rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
-        relmap = {x.attrib["Id"]: x.attrib["Target"] for x in rels}
-        target = None
-        for s in workbook.find("a:sheets", XLSX_NS):
-            if s.attrib["name"] == sheet_name:
-                rid = s.attrib[f"{{{REL_NS}}}id"]
-                target = "xl/" + relmap[rid]
-                break
-        if not target:
-            raise ValueError(f"找不到工作表：{sheet_name}")
+    try:
+        if cmd["command"] == "summary":
+            orders = load_orders_for_date(cmd["date"])
+            summary = generate_daily_summary(
+                orders, cmd["date"], order_event_store,
+                include_cancelled=True,
+                show_unassigned=ORDER_SHOW_UNASSIGNED,
+            )
+            # LINE 單一文字訊息有長度上限。舊版使用 summary[:5000]，
+            # 訂單量大時會直接把後半段簡表截掉。V1.2 改成依換行安全分段，
+            # 一次 reply 最多可帶 5 則訊息；8/28 這類 7k+ 字簡表會完整分成 2 則。
+            chunks = _split_line_text(summary, max_chars=4800)
+            messages = [TextSendMessage(text=chunk) for chunk in chunks[:5]]
+            line_bot_api.reply_message(event.reply_token, messages)
 
-        sheet = ET.fromstring(z.read(target))
-        rows: list[list[str]] = []
-        for row in sheet.findall(".//a:sheetData/a:row", XLSX_NS):
-            vals: dict[int, str] = {}
-            max_col = 0
-            for cell in row.findall("a:c", XLSX_NS):
-                col = _xlsx_colnum(cell.attrib["r"])
-                max_col = max(max_col, col)
-                typ = cell.attrib.get("t")
-                v = cell.find("a:v", XLSX_NS)
-                if v is None:
-                    inline = cell.find("a:is", XLSX_NS)
-                    value = "" if inline is None else "".join((t.text or "") for t in inline.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t"))
-                else:
-                    raw = v.text or ""
-                    value = shared[int(raw)] if typ == "s" and raw else raw
-                vals[col] = value
-            rows.append([vals.get(i, "") for i in range(1, max(max_col, 4) + 1)])
-        return rows
+            # 極端情況若超過 5 段，再用 push 補送剩餘內容。
+            if len(chunks) > 5:
+                target_id = _line_source_target_id(event)
+                if target_id:
+                    for i in range(5, len(chunks), 5):
+                        batch = [TextSendMessage(text=chunk) for chunk in chunks[i:i + 5]]
+                        line_bot_api.push_message(target_id, batch)
+            return True
+
+        if cmd["command"] == "history":
+            text_out = order_history_by_id(cmd["order_id"])
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text_out[:5000]))
+            return True
+
+        if cmd["command"] == "event":
+            event_obj = Event(
+                order_id=cmd["order_id"],
+                event_type=cmd["event_type"],
+                at=_taipei_now_iso(),
+                driver_name=cmd.get("driver_name", ""),
+                plate=cmd.get("plate", ""),
+                note=cmd.get("note", ""),
+                changes=cmd.get("changes", {}),
+            )
+            order_event_store.add(event_obj)
+            labels = {
+                "assigned": "已派", "recalled": "已拉回", "edited": "已記錄異動",
+                "cancelled": "已取消", "restored": "已恢復",
+            }
+            reply = f"✅ {cmd['order_id']} {labels.get(cmd['event_type'], '已更新')}"
+            if cmd.get("driver_name") or cmd.get("plate"):
+                reply += f"\n司機：{cmd.get('driver_name','')} {cmd.get('plate','')}".rstrip()
+            if cmd.get("note"):
+                reply += f"\n備註：{cmd['note']}"
+            if cmd.get("changes"):
+                display = "、".join(f"{k}={v}" for k, v in cmd["changes"].items())
+                reply += f"\n套用：{display}"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return True
+    except Exception as exc:
+        app.logger.exception("訂單 V1 指令失敗：%s", exc)
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=f"⚠️ 訂單功能處理失敗：{exc}")
+        )
+        return True
+
+    return False
+
+# 快取 30 秒：修改試算表後，最慢約 30 秒套用；避免每一則 LINE 訊息都打一次 Google API。
+SHEET_CACHE_SECONDS = int(os.environ.get("SHEET_CACHE_SECONDS", "30"))
+_sheet_cache = {"loaded_at": 0.0, "blocked_list": [], "special_notes": []}
+
+blocked_list = []
+special_notes = []
 
 
-def parse_line_command(text: str) -> Optional[dict[str, str]]:
-    """Parse deterministic V1 LINE commands.
+def _cell(row, index):
+    if index >= len(row):
+        return ""
+    return str(row[index]).strip()
 
-    Supported:
-      派車 KBM318185 王小明 ABC-1234
-      拉回 KBM318185 班機延誤
-      取消 KBM318185 客人取消
-      恢復 KBM318185
-      異動 KBM318185 班機延誤 10:25→11:40
-      歷程 KBM318185
-      簡表 2/1
-    """
-    text = normalize_spaces(text)
-    m = re.match(r"^(派車|拉回|取消|恢復|異動|歷程|簡表)\s+(.+)$", text)
-    if not m:
-        return None
-    command, rest = m.group(1), m.group(2).strip()
-    if command == "簡表":
-        return {"command": "summary", "date": rest}
-    oid_m = ORDER_ID_RE.search(rest)
-    if not oid_m:
-        return None
-    oid = oid_m.group(0).upper()
-    tail = normalize_spaces(rest[oid_m.end():])
-    if command == "派車":
-        parts = tail.split(" ") if tail else []
-        return {
-            "command": "event", "event_type": "assigned", "order_id": oid,
-            "driver_name": parts[0] if parts else "",
-            "plate": parts[1] if len(parts) > 1 else "",
-            "note": " ".join(parts[2:]) if len(parts) > 2 else "",
+
+def _enabled(value):
+    return str(value).strip().lower() not in {"false", "0", "no", "off", "停用"}
+
+
+def load_driver_lists(force=False):
+    global blocked_list, special_notes
+
+    now = time.time()
+    if (
+        not force
+        and _sheet_cache["loaded_at"]
+        and now - _sheet_cache["loaded_at"] < SHEET_CACHE_SECONDS
+    ):
+        blocked_list = _sheet_cache["blocked_list"]
+        special_notes = _sheet_cache["special_notes"]
+        return blocked_list, special_notes
+
+    range_name = f"{GOOGLE_SHEET_TAB}!A:J"
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/"
+        f"{range_name}"
+    )
+
+    # 使用 Service Account 取得 OAuth Access Token
+    if not GOOGLE_CREDENTIALS.valid:
+        GOOGLE_CREDENTIALS.refresh(GoogleAuthRequest())
+
+    headers = {
+        "Authorization": f"Bearer {GOOGLE_CREDENTIALS.token}"
+    }
+
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=10
+    )
+
+    if response.status_code != 200:
+        app.logger.error(
+            "Google Sheets API 錯誤 %s：%s",
+            response.status_code,
+            response.text
+        )
+
+    response.raise_for_status()
+    values = response.json().get("values", [])
+
+    if not values:
+        blocked_list = []
+        special_notes = []
+        return blocked_list, special_notes
+
+    headers = [str(x).strip().lower() for x in values[0]]
+    expected = [
+        "type", "name", "plate", "phone", "vehicle",
+        "color", "bank_code", "account", "note", "enabled"
+    ]
+    if headers[:10] != expected:
+        raise RuntimeError(
+            "drivers 工作表欄位不正確。A1:J1 必須是：" + ", ".join(expected)
+        )
+
+    new_blocked = []
+    new_special = []
+
+    for row in values[1:]:
+        row_type = _cell(row, 0).lower()
+        name = _cell(row, 1)
+
+        if not name or not _enabled(_cell(row, 9)):
+            continue
+
+        phone_text = _cell(row, 3)
+        phones = [
+            p.strip() for p in re.split(r"[,，;；/\n]+", phone_text) if p.strip()
+        ]
+
+        item = {
+            "name": name,
+            "plate": _cell(row, 2),
+            "phone": phones,
+            "vehicle": _cell(row, 4),
+            "color": _cell(row, 5),
+            "bank_code": _cell(row, 6),
+            "account": _cell(row, 7),
+            "note": _cell(row, 8),
         }
-    mapping = {"拉回": "recalled", "取消": "cancelled", "恢復": "restored", "異動": "edited"}
-    if command == "歷程":
-        return {"command": "history", "order_id": oid}
-    changes = parse_change_note(tail) if command == "異動" else {}
-    return {"command": "event", "event_type": mapping[command], "order_id": oid, "note": tail, "changes": changes}
+
+        if row_type == "blacklist":
+            new_blocked.append(item)
+        elif row_type == "special":
+            new_special.append(item)
+
+    blocked_list = new_blocked
+    special_notes = new_special
+    _sheet_cache["loaded_at"] = now
+    _sheet_cache["blocked_list"] = new_blocked
+    _sheet_cache["special_notes"] = new_special
+
+    app.logger.info(
+        "Google Sheet loaded: blacklist=%s, special=%s",
+        len(blocked_list),
+        len(special_notes),
+    )
+    return blocked_list, special_notes
 
 
-def _cli() -> None:
-    p = argparse.ArgumentParser(description="訂單每日簡表 V1")
-    p.add_argument("xlsx", help="Google Sheet 匯出的 xlsx")
-    p.add_argument("--sheet", required=True, help="月份分頁，例如 2月")
-    p.add_argument("--date", required=True, help="日期，例如 2/1")
-    p.add_argument("--events", default="order_events_v1.json", help="事件 JSON")
-    p.add_argument("--show-unassigned", action="store_true", help="顯示【未派】")
-    args = p.parse_args()
+def display_phone(value):
+    if isinstance(value, list):
+        cleaned = [normalize_phone(v) for v in value if normalize_phone(v)]
+        return "、".join(cleaned) if cleaned else "未提供"
+    normalized = normalize_phone(value)
+    return normalized or "未提供"
 
-    orders = parse_rows(load_rows_from_xlsx(args.xlsx, args.sheet))
-    store = EventStore(args.events)
-    print(generate_daily_summary(orders, args.date, store, show_unassigned=args.show_unassigned))
 
+# =====================================================
+# 資料格式化
+# =====================================================
+
+def normalize_phone(value):
+    """
+    電話格式統一
+
+    0932-395-446
+    0932395446
+    +886932395446
+    886932395446
+
+    最後都轉成：
+
+    0932395446
+    """
+
+    if not value:
+        return ""
+
+    value = str(value).strip()
+
+    # 移除空白、-、括號
+    value = re.sub(r"[\s\-\(\)]", "", value)
+
+    # +886932395446
+    if value.startswith("+886"):
+        value = "0" + value[4:]
+
+    # 886932395446
+    elif value.startswith("8869"):
+        value = "0" + value[3:]
+
+    return value
+
+
+def normalize_plate(value):
+    """
+    車號格式統一
+
+    RFR-9770
+    RFR 9770
+    RFR9770
+
+    都轉成：
+
+    RFR9770
+    """
+
+    if not value:
+        return ""
+
+    return re.sub(
+        r"[^A-Za-z0-9]",
+        "",
+        str(value)
+    ).upper()
+
+
+def normalize_account(value):
+    """
+    匯款帳號只保留數字
+    """
+
+    if not value:
+        return ""
+
+    return re.sub(
+        r"\D",
+        "",
+        str(value)
+    )
+
+
+# =====================================================
+# 回覆黑名單資料
+# =====================================================
+
+def reply_blacklist(event, item, match_type):
+
+    name = item.get("name", "未提供")
+    phone = display_phone(item.get("phone", []))
+    plate = item.get("plate", "")
+    vehicle = item.get("vehicle", "未提供")
+    color = item.get("color", "未提供")
+    bank_code = item.get("bank_code", "")
+    account = item.get("account", "")
+    note = item.get("note", "").strip()
+
+    if not phone:
+        phone = "未提供"
+
+    if not plate:
+        plate = "未提供"
+
+    if not bank_code:
+        bank_code = "未提供"
+
+    if not account:
+        account = "未提供"
+
+    reply_text = (
+        f"🚨🚨 黑名單警告 🚨🚨\n"
+        f"\n"
+        f"匹配方式：{match_type}\n"
+        f"\n"
+        f"駕駛：{name}\n"
+        f"電話：{phone}\n"
+        f"車號：{plate}\n"
+        f"車型：{vehicle}\n"
+        f"顏色：{color}\n"
+        f"銀行代碼：{bank_code}\n"
+        f"匯款帳號：{account}\n"
+    )
+
+    # 有填備註才顯示
+    if note:
+        reply_text += (
+            f"\n"
+            f"📝 黑名單備註：\n"
+            f"{note}\n"
+        )
+
+    reply_text += (
+        f"\n"
+        f"🚨 此司機永久禁派 🚨"
+    )
+
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=reply_text)
+    )
+
+# =====================================================
+# 回覆特殊註記
+# =====================================================
+
+def reply_special_note(event, item, match_type):
+
+    name = item.get("name", "未提供")
+    phone = display_phone(item.get("phone", []))
+    plate = item.get("plate", "")
+    vehicle = item.get("vehicle", "未提供")
+    color = item.get("color", "未提供")
+    note = item.get(
+        "note",
+        "請留意此司機特殊狀況"
+    )
+
+    if not phone:
+        phone = "未提供"
+
+    if not plate:
+        plate = "未提供"
+
+    reply_text = (
+        f"⚠️⚠️ 司機特殊提醒 ⚠️⚠️\n"
+        f"\n"
+        f"匹配方式：{match_type}\n"
+        f"\n"
+        f"駕駛：{name}\n"
+        f"電話：{phone}\n"
+        f"車號：{plate}\n"
+        f"車型：{vehicle}\n"
+        f"顏色：{color}\n"
+        f"\n"
+        f"📝 特殊註記：\n"
+        f"{note}\n"
+        f"\n"
+        f"⚠️ 此司機並非黑名單\n"
+        f"⚠️ 請派單時留意"
+    )
+
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=reply_text)
+    )
+
+
+# =====================================================
+# 姓名比對
+# 優先順序 ①
+# =====================================================
+
+def check_name(text):
+
+    text_lower = text.lower()
+
+    # -----------------------------
+    # 先檢查黑名單
+    # -----------------------------
+
+    for item in blocked_list:
+
+        name = item.get(
+            "name",
+            ""
+        ).strip()
+
+        if not name:
+            continue
+
+        if name.lower() in text_lower:
+            return "blacklist", item, "姓名"
+
+
+    # -----------------------------
+    # 再檢查特殊註記
+    # -----------------------------
+
+    for item in special_notes:
+
+        name = item.get(
+            "name",
+            ""
+        ).strip()
+
+        if not name:
+            continue
+
+        if name.lower() in text_lower:
+            return "special", item, "姓名"
+
+    return None
+
+
+# =====================================================
+# 車號比對
+# 優先順序 ②
+# =====================================================
+
+def check_plate(text):
+
+    clean_text = normalize_plate(text)
+
+    if not clean_text:
+        return None
+
+    # -----------------------------
+    # 黑名單
+    # -----------------------------
+
+    for item in blocked_list:
+
+        plate = normalize_plate(
+            item.get("plate", "")
+        )
+
+        if not plate:
+            continue
+
+        if plate in clean_text:
+            return "blacklist", item, "車號"
+
+
+    # -----------------------------
+    # 特殊註記
+    # -----------------------------
+
+    for item in special_notes:
+
+        plate = normalize_plate(
+            item.get("plate", "")
+        )
+
+        if not plate:
+            continue
+
+        if plate in clean_text:
+            return "special", item, "車號"
+
+    return None
+
+
+# =====================================================
+# 電話比對
+# 優先順序 ③
+# =====================================================
+def check_phone(text):
+
+    # 抓出訊息中的 8～20 位數字
+    numbers = re.findall(
+        r"\d{8,20}",
+        text
+    )
+
+    normalized_numbers = []
+
+    for number in numbers:
+        normalized = normalize_phone(number)
+
+        if normalized:
+            normalized_numbers.append(normalized)
+
+
+    # =================================================
+    # 黑名單電話比對
+    # =================================================
+
+    for item in blocked_list:
+
+        phones = item.get("phone", [])
+
+        # 如果只有一支電話，轉成 list
+        if isinstance(phones, str):
+            phones = [phones]
+
+        for phone in phones:
+
+            normalized_phone = normalize_phone(phone)
+
+            if normalized_phone in normalized_numbers:
+                return "blacklist", item, "電話"
+
+
+    # =================================================
+    # 特殊註記電話比對
+    # =================================================
+
+    for item in special_notes:
+
+        phones = item.get("phone", [])
+
+        # 如果只有一支電話，轉成 list
+        if isinstance(phones, str):
+            phones = [phones]
+
+        for phone in phones:
+
+            normalized_phone = normalize_phone(phone)
+
+            if normalized_phone in normalized_numbers:
+                return "special", item, "電話"
+
+
+    return None
+    
+# =====================================================
+# 匯款資料比對
+# 優先順序 ④
+# =====================================================
+
+def check_account(text):
+
+    numbers = re.findall(
+        r"\d{8,20}",
+        text
+    )
+
+    # -----------------------------
+    # 黑名單
+    # -----------------------------
+
+    for item in blocked_list:
+
+        account = normalize_account(
+            item.get("account", "")
+        )
+
+        if not account:
+            continue
+
+        for number in numbers:
+
+            if normalize_account(number) == account:
+                return "blacklist", item, "匯款帳號"
+
+
+    # -----------------------------
+    # 特殊註記
+    # -----------------------------
+
+    for item in special_notes:
+
+        account = normalize_account(
+            item.get("account", "")
+        )
+
+        if not account:
+            continue
+
+        for number in numbers:
+
+            if normalize_account(number) == account:
+                return "special", item, "匯款帳號"
+
+    return None
+
+
+# =====================================================
+# 健康檢查（Render / 瀏覽器測試用）
+# =====================================================
+
+@app.route("/", methods=["GET"])
+def health_check():
+    return f"LINE bot is running | order parser {PARSER_VERSION}", 200
+
+
+# =====================================================
+# LINE Webhook
+# =====================================================
+
+@app.route("/callback", methods=["POST"])
+def callback():
+
+    # 取得 LINE Signature
+    signature = request.headers.get(
+        "X-Line-Signature"
+    )
+
+    if not signature:
+        abort(400)
+
+
+    # 取得訊息內容
+    body = request.get_data(
+        as_text=True
+    )
+
+    app.logger.info(
+        "Request body: " + body
+    )
+
+
+    # LINE 驗證
+    try:
+
+        handler.handle(
+            body,
+            signature
+        )
+
+    except InvalidSignatureError:
+
+        print(
+            "Invalid signature. "
+            "Please check your "
+            "channel access token/channel secret."
+        )
+
+        abort(400)
+
+
+    return "OK"
+
+
+# =====================================================
+# 收到 LINE 文字訊息
+# =====================================================
+
+@handler.add(
+    MessageEvent,
+    message=TextMessage
+)
+def handle_message(event):
+
+    text = event.message.text.strip()
+
+    # 訂單解析器版本檢查：可在 LINE 輸入「版本」確認 Render 目前實際載入哪一版。
+    if text in {"版本", "訂單版本", "parser version"}:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=f"訂單解析器：{PARSER_VERSION}")
+        )
+        return
+
+    # 每則訊息處理前確認 Google Sheet 快取；預設每 30 秒更新一次。
+    try:
+        load_driver_lists()
+    except Exception as exc:
+        app.logger.exception("讀取 Google Sheet 失敗：%s", exc)
+        # 若先前已有成功快取，繼續使用舊資料，避免 Google 暫時異常時 Bot 完全失效。
+        if not blocked_list and not special_notes:
+            return
+
+    if not text:
+        return
+
+
+    # =================================================
+    # ① 姓名
+    # =================================================
+
+    result = check_name(text)
+
+    if result:
+
+        result_type, item, match_type = result
+
+        if result_type == "blacklist":
+
+            reply_blacklist(
+                event,
+                item,
+                match_type
+            )
+
+        else:
+
+            reply_special_note(
+                event,
+                item,
+                match_type
+            )
+
+        return
+
+
+    # =================================================
+    # ② 車號
+    # =================================================
+
+    result = check_plate(text)
+
+    if result:
+
+        result_type, item, match_type = result
+
+        if result_type == "blacklist":
+
+            reply_blacklist(
+                event,
+                item,
+                match_type
+            )
+
+        else:
+
+            reply_special_note(
+                event,
+                item,
+                match_type
+            )
+
+        return
+
+
+    # =================================================
+    # ③ 電話
+    # =================================================
+
+    result = check_phone(text)
+
+    if result:
+
+        result_type, item, match_type = result
+
+        if result_type == "blacklist":
+
+            reply_blacklist(
+                event,
+                item,
+                match_type
+            )
+
+        else:
+
+            reply_special_note(
+                event,
+                item,
+                match_type
+            )
+
+        return
+
+
+    # =================================================
+    # ④ 匯款帳號
+    # =================================================
+
+    result = check_account(text)
+
+    if result:
+
+        result_type, item, match_type = result
+
+        if result_type == "blacklist":
+
+            reply_blacklist(
+                event,
+                item,
+                match_type
+            )
+
+        else:
+
+            reply_special_note(
+                event,
+                item,
+                match_type
+            )
+
+        return
+
+    # =================================================
+    # ⑤ 訂單每日簡表 / 調度事件 V1
+    # 保留原本黑名單與特殊註記優先權，安全檢查通過後才寫入調度事件。
+    # =================================================
+    if handle_order_v1_command(event, text):
+        return
+
+
+# =====================================================
+# 啟動 Flask
+# =====================================================
 
 if __name__ == "__main__":
-    _cli()
+    port = int(os.environ.get("PORT", 3000))
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False
+    )
