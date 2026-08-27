@@ -196,6 +196,49 @@ def order_history_by_id(order_id):
     return "\n".join(lines)
 
 
+def _split_line_text(text, max_chars=4800):
+    """依換行切 LINE 長文字，避免直接截斷造成訂單看起來像漏抓。"""
+    text = str(text or "")
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    current = []
+    current_len = 0
+    for line in text.splitlines():
+        add_len = len(line) + (1 if current else 0)
+        if current and current_len + add_len > max_chars:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = len(line)
+        elif len(line) > max_chars:
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                current_len = 0
+            for start in range(0, len(line), max_chars):
+                chunks.append(line[start:start + max_chars])
+        else:
+            current.append(line)
+            current_len += add_len
+    if current:
+        chunks.append("\n".join(current))
+    return [c for c in chunks if c]
+
+
+def _line_source_target_id(event):
+    """取得群組 / 聊天室 / 個人 push target。"""
+    source = getattr(event, "source", None)
+    if source is None:
+        return ""
+    return (
+        getattr(source, "group_id", "")
+        or getattr(source, "room_id", "")
+        or getattr(source, "user_id", "")
+        or ""
+    )
+
+
 def handle_order_v1_command(event, text):
     cmd = parse_line_command(text)
     if not cmd:
@@ -209,7 +252,20 @@ def handle_order_v1_command(event, text):
                 include_cancelled=True,
                 show_unassigned=ORDER_SHOW_UNASSIGNED,
             )
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=summary[:5000]))
+            # LINE 單一文字訊息有長度上限。舊版使用 summary[:5000]，
+            # 訂單量大時會直接把後半段簡表截掉。V1.2 改成依換行安全分段，
+            # 一次 reply 最多可帶 5 則訊息；8/28 這類 7k+ 字簡表會完整分成 2 則。
+            chunks = _split_line_text(summary, max_chars=4800)
+            messages = [TextSendMessage(text=chunk) for chunk in chunks[:5]]
+            line_bot_api.reply_message(event.reply_token, messages)
+
+            # 極端情況若超過 5 段，再用 push 補送剩餘內容。
+            if len(chunks) > 5:
+                target_id = _line_source_target_id(event)
+                if target_id:
+                    for i in range(5, len(chunks), 5):
+                        batch = [TextSendMessage(text=chunk) for chunk in chunks[i:i + 5]]
+                        line_bot_api.push_message(target_id, batch)
             return True
 
         if cmd["command"] == "history":
