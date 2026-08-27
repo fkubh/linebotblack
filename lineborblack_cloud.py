@@ -4,6 +4,7 @@ import json
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
 from order_summary_v1 import (
     Event, EventStore, generate_daily_summary, parse_line_command, parse_rows
@@ -92,6 +93,7 @@ GOOGLE_CREDENTIALS = service_account.Credentials.from_service_account_info(
 ORDER_SHEET_ID = os.environ.get("ORDER_SHEET_ID", "").strip()
 ORDER_EVENTS_PATH = os.environ.get("ORDER_EVENTS_PATH", "order_events_v1.json")
 ORDER_SHEET_MAX_COL = os.environ.get("ORDER_SHEET_MAX_COL", "H")
+ORDER_SHEET_TAB_TEMPLATE = os.environ.get("ORDER_SHEET_TAB_TEMPLATE", "{year}/{month}月")
 ORDER_SHOW_UNASSIGNED = os.environ.get("ORDER_SHOW_UNASSIGNED", "false").lower() in {"1", "true", "yes", "on"}
 order_event_store = EventStore(ORDER_EVENTS_PATH)
 
@@ -104,9 +106,11 @@ def _sheet_values(spreadsheet_id, range_name):
     if not GOOGLE_CREDENTIALS.valid:
         GOOGLE_CREDENTIALS.refresh(GoogleAuthRequest())
     headers = {"Authorization": f"Bearer {GOOGLE_CREDENTIALS.token}"}
+    # A1 range 可能包含 /、空白、中文等字元，因此整段做 URL encode。
+    encoded_range = quote(range_name, safe="")
     url = (
         f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
-        f"{range_name}"
+        f"{encoded_range}"
     )
     response = requests.get(url, headers=headers, timeout=15)
     if response.status_code != 200:
@@ -115,15 +119,31 @@ def _sheet_values(spreadsheet_id, range_name):
     return response.json().get("values", [])
 
 
+def _resolve_order_sheet_date(date_text):
+    """支援 M/D 與 YYYY/M/D；未填年份時使用台北目前年份。"""
+    full = re.search(r"(?<!\d)(20\d{2})\s*/\s*(\d{1,2})\s*/\s*(\d{1,2})(?!\d)", date_text)
+    if full:
+        return int(full.group(1)), int(full.group(2)), int(full.group(3))
+
+    short = re.search(r"(?<!\d)(\d{1,2})\s*/\s*(\d{1,2})(?!\d)", date_text)
+    if not short:
+        raise ValueError("日期格式請輸入 M/D，例如：簡表 8/28；也可輸入 YYYY/M/D")
+
+    year = datetime.now(ZoneInfo("Asia/Taipei")).year
+    return year, int(short.group(1)), int(short.group(2))
+
+
 def load_orders_for_date(date_text):
     if not ORDER_SHEET_ID:
         raise RuntimeError("尚未設定 ORDER_SHEET_ID")
-    m = re.search(r"(\d{1,2})\s*/\s*(\d{1,2})", date_text)
-    if not m:
-        raise ValueError("日期格式請輸入 M/D，例如：簡表 8/28")
-    month = int(m.group(1))
-    tab_name = f"{month}月"
-    rows = _sheet_values(ORDER_SHEET_ID, f"{tab_name}!A:{ORDER_SHEET_MAX_COL}")
+
+    year, month, day = _resolve_order_sheet_date(date_text)
+    tab_name = ORDER_SHEET_TAB_TEMPLATE.format(year=year, month=month, day=day)
+
+    # 分頁名稱含 / 時，A1 notation 必須用單引號包起來，例如：'2026/8月'!A:H
+    range_name = f"'{tab_name}'!A:{ORDER_SHEET_MAX_COL}"
+    app.logger.info("讀取訂單分頁：%s", tab_name)
+    rows = _sheet_values(ORDER_SHEET_ID, range_name)
     return parse_rows(rows)
 
 
