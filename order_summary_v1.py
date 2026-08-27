@@ -14,6 +14,7 @@ time, passenger count and current dispatch state.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import re
 import zipfile
@@ -132,7 +133,8 @@ def parse_fields(raw: str) -> tuple[list[str], dict[str, str]]:
     fields: dict[str, str] = {}
     current: Optional[str] = None
 
-    for raw_line in (raw or "").replace("\r\n", "\n").split("\n"):
+    cleaned_raw = html.unescape(raw or "").replace("\r\n", "\n").replace("\r", "\n")
+    for raw_line in cleaned_raw.split("\n"):
         line = raw_line.strip()
         if not line:
             continue
@@ -277,25 +279,82 @@ def district_for_order(trip_type: str, fields: dict[str, str]) -> str:
 
 
 def vehicle_tag(raw: str) -> str:
-    head = raw.splitlines()[0].replace(" ", "") if raw else ""
-    if "高五" in head:
-        return "高五"
-    if "休旅" in head or "七座" in head:
-        return "休旅"
-    if "九座" in head or "高九" in head:
+    """Map vehicle wording using strict priority.
+
+    Only the order header area is inspected. More specific classes are always checked
+    before generic classes so 高九 can never fall through to 九座, and 假七/七座/經七
+    always become 經七.
+    """
+    text = html.unescape(raw or "").replace("\r", "\n")
+    # Vehicle wording is expected before the labelled fields. Keep enough text to survive
+    # odd blank lines/BOMs while avoiding notes that may mention another vehicle class.
+    header_area = text.split("出發日期", 1)[0]
+    header_area = re.sub(r"[\s\u3000]+", "", header_area)
+    lower = header_area.lower()
+
+    # Strict precedence: specific names first.
+    if "alphard" in lower or "阿法" in header_area:
+        return "Alphard"
+    if "保母車" in header_area:
+        return "保母車"
+    if "高九" in header_area:
+        return "高九"
+    if "九座" in header_area:
         return "九座"
-    # 經五 / 進口五 / 四座 / 五座 deliberately omitted from the compact summary.
+    if "高七" in header_area:
+        return "高七"
+    if any(x in header_area for x in ("經七", "七座", "假七")):
+        return "經七"
+    if "高五" in header_area:
+        return "高五"
+    if any(x in header_area for x in ("休旅", "休五")):
+        return "休旅"
+    # 四座 / 經五 / 一般五座 intentionally hidden.
     return ""
 
 
 def extra_tags(fields: dict[str, str]) -> list[str]:
-    notes = fields.get("其他備註", "")
-    tags: list[str] = []
-    if re.search(r"兒童安全座椅|嬰兒座椅|安全座椅|汽座", notes):
-        tags.append("安座")
-    if re.search(r"舉牌", notes):
-        tags.append("舉牌")
-    return tags
+    """Return only seat/accessory tags that belong inside 【】.
+
+    Priority is exclusive: booster wording wins over generic safety-seat wording.
+    This prevents 前向式安全座椅（增高） from becoming 安椅.
+    """
+    notes = html.unescape(fields.get("其他備註", "") or "")
+    compact = re.sub(r"[\s\u3000]+", "", notes)
+
+    booster_patterns = (
+        r"前向式安全座椅[（(]?(?:增高|增高型)[）)]?",
+        r"兒童增高墊",
+        r"增高墊",
+    )
+    if any(re.search(p, compact, re.I) for p in booster_patterns):
+        return ["增高墊"]
+
+    seat_pattern = (
+        r"嬰兒座椅|兒童安全座椅|向後式嬰兒安全座椅|向後式座椅|"
+        r"前向式安全座椅|安全座椅|汽座"
+    )
+    if re.search(seat_pattern, compact, re.I):
+        return ["安椅"]
+    return []
+
+
+def external_markers(order: Order) -> str:
+    """Markers shown outside 【】 according to dispatch rules.
+
+    - 舉牌 -> *舉牌*
+    - 松山機場 -> *(松機)
+    - 指定時間 -> *指定時間*
+    """
+    markers: list[str] = []
+    full_text = "\n".join([order.raw_text, order.pickup, order.dropoff, order.notes])
+    if "舉牌" in order.notes:
+        markers.append("*舉牌*")
+    if re.search(r"松山機場|台北松山機場|臺北松山機場", full_text):
+        markers.append("*(松機)")
+    if "指定時間" in full_text:
+        markers.append("*指定時間*")
+    return "".join(markers)
 
 
 def parse_order_row(row: list[str], row_number: int) -> Optional[Order]:
@@ -380,12 +439,23 @@ def parse_change_note(note: str) -> dict[str, str]:
         changes["date"] = extract_date(changes["date"])
     if "vehicle_tag" in changes:
         v = changes["vehicle_tag"]
-        if "高五" in v:
-            changes["vehicle_tag"] = "高五"
-        elif "休旅" in v or "七" in v:
-            changes["vehicle_tag"] = "休旅"
-        elif "九" in v:
+        vl = v.lower()
+        if "alphard" in vl or "阿法" in v:
+            changes["vehicle_tag"] = "Alphard"
+        elif "保母車" in v:
+            changes["vehicle_tag"] = "保母車"
+        elif "高九" in v:
+            changes["vehicle_tag"] = "高九"
+        elif "九座" in v:
             changes["vehicle_tag"] = "九座"
+        elif "高七" in v:
+            changes["vehicle_tag"] = "高七"
+        elif any(x in v for x in ["經七", "七座", "假七"]):
+            changes["vehicle_tag"] = "經七"
+        elif "高五" in v:
+            changes["vehicle_tag"] = "高五"
+        elif "休旅" in v or "休五" in v:
+            changes["vehicle_tag"] = "休旅"
         elif v in {"無", "一般", "經五", "五座", "四座"}:
             changes["vehicle_tag"] = ""
     return changes
@@ -479,11 +549,12 @@ def summary_line(order: Order, status: str, show_unassigned: bool = False) -> st
     pax = f"{order.pax}人" if order.pax else "?人"
     route = f"接{order.district_text}" if order.trip_type == "接機" else f"{order.district_text}送"
     tags = compact_tags(order)
+    markers = external_markers(order)
     status_text = ""
     if status != "未派" or show_unassigned:
         status_text = f"【{status}】"
     source_tag = f"({order.source_tag})" if order.source_tag else ""
-    return f"{time_text} {pax} {route}{tags}-{order.order_id}{source_tag}{status_text}"
+    return f"{time_text} {pax} {route}{tags}-{order.order_id}{source_tag}{markers}{status_text}"
 
 
 def generate_daily_summary(
