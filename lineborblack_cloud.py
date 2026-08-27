@@ -2,6 +2,12 @@ import os
 import re
 import json
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from order_summary_v1 import (
+    Event, EventStore, generate_daily_summary, parse_line_command, parse_rows
+)
 
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -78,6 +84,153 @@ GOOGLE_CREDENTIALS = service_account.Credentials.from_service_account_info(
     GOOGLE_SERVICE_ACCOUNT_INFO,
     scopes=GOOGLE_SCOPES,
 )
+
+# =====================================================
+# 訂單每日簡表 V1
+# =====================================================
+# 訂單可使用另一份 Google Sheet；若未設定則停用簡表功能，不影響原本司機黑名單功能。
+ORDER_SHEET_ID = os.environ.get("ORDER_SHEET_ID", "").strip()
+ORDER_EVENTS_PATH = os.environ.get("ORDER_EVENTS_PATH", "order_events_v1.json")
+ORDER_SHEET_MAX_COL = os.environ.get("ORDER_SHEET_MAX_COL", "H")
+ORDER_SHOW_UNASSIGNED = os.environ.get("ORDER_SHOW_UNASSIGNED", "false").lower() in {"1", "true", "yes", "on"}
+order_event_store = EventStore(ORDER_EVENTS_PATH)
+
+
+def _taipei_now_iso():
+    return datetime.now(ZoneInfo("Asia/Taipei")).isoformat(timespec="minutes")
+
+
+def _sheet_values(spreadsheet_id, range_name):
+    if not GOOGLE_CREDENTIALS.valid:
+        GOOGLE_CREDENTIALS.refresh(GoogleAuthRequest())
+    headers = {"Authorization": f"Bearer {GOOGLE_CREDENTIALS.token}"}
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
+        f"{range_name}"
+    )
+    response = requests.get(url, headers=headers, timeout=15)
+    if response.status_code != 200:
+        app.logger.error("訂單 Google Sheets API 錯誤 %s：%s", response.status_code, response.text)
+    response.raise_for_status()
+    return response.json().get("values", [])
+
+
+def load_orders_for_date(date_text):
+    if not ORDER_SHEET_ID:
+        raise RuntimeError("尚未設定 ORDER_SHEET_ID")
+    m = re.search(r"(\d{1,2})\s*/\s*(\d{1,2})", date_text)
+    if not m:
+        raise ValueError("日期格式請輸入 M/D，例如：簡表 8/28")
+    month = int(m.group(1))
+    tab_name = f"{month}月"
+    rows = _sheet_values(ORDER_SHEET_ID, f"{tab_name}!A:{ORDER_SHEET_MAX_COL}")
+    return parse_rows(rows)
+
+
+def order_history_by_id(order_id):
+    events = [e for e in order_event_store.events if e.order_id.upper() == order_id.upper()]
+    events.sort(key=lambda e: e.at)
+    if not events:
+        return f"{order_id}\n尚無調度／異動紀錄"
+    assigned = 0
+    recalled = 0
+    edited = 0
+    cancelled = False
+    active_driver = ""
+    active_plate = ""
+    for e in events:
+        if e.event_type == "assigned":
+            assigned += 1
+            active_driver, active_plate = e.driver_name, e.plate
+            cancelled = False
+        elif e.event_type in {"recalled", "unassigned"}:
+            recalled += 1
+            active_driver = active_plate = ""
+        elif e.event_type == "edited":
+            edited += 1
+        elif e.event_type == "cancelled":
+            cancelled = True
+            active_driver = active_plate = ""
+        elif e.event_type == "restored":
+            cancelled = False
+    if cancelled:
+        current = "取消"
+    elif active_driver or active_plate:
+        current = "重派・已派" if assigned >= 2 and recalled >= 1 else "已派"
+        if edited:
+            current = "異動・" + current
+    elif edited:
+        current = "異動・未派"
+    else:
+        current = "未派"
+    lines = [
+        f"{order_id}｜目前：{current}",
+        f"異動 {edited} 次／指派 {assigned} 次／拉回 {recalled} 次",
+    ]
+    if active_driver or active_plate:
+        lines.append(f"目前司機：{active_driver} {active_plate}".rstrip())
+    lines.append("")
+    for e in events:
+        detail = " ".join(x for x in [e.driver_name, e.plate, e.note] if x)
+        lines.append(f"{e.at}｜{e.event_type}{('｜' + detail) if detail else ''}")
+    return "\n".join(lines)
+
+
+def handle_order_v1_command(event, text):
+    cmd = parse_line_command(text)
+    if not cmd:
+        return False
+
+    try:
+        if cmd["command"] == "summary":
+            orders = load_orders_for_date(cmd["date"])
+            summary = generate_daily_summary(
+                orders, cmd["date"], order_event_store,
+                include_cancelled=True,
+                show_unassigned=ORDER_SHOW_UNASSIGNED,
+            )
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=summary[:5000]))
+            return True
+
+        if cmd["command"] == "history":
+            text_out = order_history_by_id(cmd["order_id"])
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text_out[:5000]))
+            return True
+
+        if cmd["command"] == "event":
+            event_obj = Event(
+                order_id=cmd["order_id"],
+                event_type=cmd["event_type"],
+                at=_taipei_now_iso(),
+                driver_name=cmd.get("driver_name", ""),
+                plate=cmd.get("plate", ""),
+                note=cmd.get("note", ""),
+                changes=cmd.get("changes", {}),
+            )
+            order_event_store.add(event_obj)
+            labels = {
+                "assigned": "已派", "recalled": "已拉回", "edited": "已記錄異動",
+                "cancelled": "已取消", "restored": "已恢復",
+            }
+            reply = f"✅ {cmd['order_id']} {labels.get(cmd['event_type'], '已更新')}"
+            if cmd.get("driver_name") or cmd.get("plate"):
+                reply += f"\n司機：{cmd.get('driver_name','')} {cmd.get('plate','')}".rstrip()
+            if cmd.get("note"):
+                reply += f"\n備註：{cmd['note']}"
+            if cmd.get("changes"):
+                display = "、".join(f"{k}={v}" for k, v in cmd["changes"].items())
+                reply += f"\n套用：{display}"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return True
+    except Exception as exc:
+        app.logger.exception("訂單 V1 指令失敗：%s", exc)
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=f"⚠️ 訂單功能處理失敗：{exc}")
+        )
+        return True
+
+    return False
 
 # 快取 30 秒：修改試算表後，最慢約 30 秒套用；避免每一則 LINE 訊息都打一次 Google API。
 SHEET_CACHE_SECONDS = int(os.environ.get("SHEET_CACHE_SECONDS", "30"))
@@ -793,6 +946,13 @@ def handle_message(event):
                 match_type
             )
 
+        return
+
+    # =================================================
+    # ⑤ 訂單每日簡表 / 調度事件 V1
+    # 保留原本黑名單與特殊註記優先權，安全檢查通過後才寫入調度事件。
+    # =================================================
+    if handle_order_v1_command(event, text):
         return
 
 
