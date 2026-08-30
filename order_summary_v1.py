@@ -13,7 +13,7 @@ time, passenger count and current dispatch state.
 
 from __future__ import annotations
 
-PARSER_VERSION = "V1.6.10-20260831-group-filter-recall-cleanup"
+PARSER_VERSION = "V1.6.11-20260831-live-sheet-refresh"
 
 import argparse
 import html

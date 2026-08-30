@@ -1042,6 +1042,18 @@ def capture_line_activity(event, text):
 
     return False
 
+def _refresh_order_state_from_sheet():
+    """V1.6.11：查簡表前重新從永久 Google Sheet 載入最新狀態。
+
+    Render/Gunicorn 可能有不同 worker，各 worker 的記憶體快取不一定同步。
+    以 Google Sheet 為唯一真實來源，避免已派訂單仍被舊 worker 列成未派。
+    """
+    if hasattr(order_event_store, "load"):
+        order_event_store.load()
+    if hasattr(line_order_store, "load"):
+        line_order_store.load()
+
+
 def handle_order_v1_command(event, text):
     raw_text = text
     command_text = _strip_summary_password(raw_text)
@@ -1067,6 +1079,9 @@ def handle_order_v1_command(event, text):
 
     try:
         if cmd["command"] in {"summary", "summary_unassigned"}:
+            # V1.6.11：每次查詢前都以永久 Google Sheet 最新資料為準，
+            # 不依賴目前 Render worker 的舊記憶體快取。
+            _refresh_order_state_from_sheet()
             _record_bot_usage(
                 event,
                 "未派簡表查詢" if cmd["command"] == "summary_unassigned" else "完整簡表查詢",
