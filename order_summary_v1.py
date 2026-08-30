@@ -13,7 +13,7 @@ time, passenger count and current dispatch state.
 
 from __future__ import annotations
 
-PARSER_VERSION = "V1.6-20260831-line-merge"
+PARSER_VERSION = "V1.6.1-20260831-driver-format"
 
 import argparse
 import html
@@ -250,7 +250,7 @@ def merge_sheet_and_line_orders(sheet_orders: list[Order], line_store: Optional[
 
 
 DRIVER_NAME_PATTERNS = (
-    r"(?:司機姓名|駕駛姓名|司機|駕駛)\s*[：:]\s*([^\n\r，,]{2,20})",
+    r"(?:服務駕駛|司機姓名|駕駛姓名|司機|駕駛)\s*[：:]\s*([^\n\r，,]{2,20})",
 )
 PLATE_PATTERNS = (
     r"(?:車號|車牌|車牌號碼)\s*[：:]\s*([A-Z0-9]{2,5}-?[A-Z0-9]{2,5})",
@@ -258,19 +258,49 @@ PLATE_PATTERNS = (
 
 
 def extract_driver_info(text: str) -> tuple[str, str]:
-    raw = text or ""
+    """Extract driver name/plate from the two real dispatch formats.
+
+    Supported examples:
+      服務駕駛：陳宥佐 / 車號：RGD-5015
+      姓名：陳宗鑫 / 車牌：RFX-1227 / 車型：...
+    The generic 姓名 field is only accepted when it is close to a vehicle plate
+    and appears in the same trailing driver block, so passenger/contact names
+    earlier in the order are not mistaken for drivers.
+    """
+    raw = html.unescape(text or "").replace("\r\n", "\n").replace("\r", "\n")
     name = ""
     plate = ""
+
+    # Strong driver-name labels first.
     for p in DRIVER_NAME_PATTERNS:
         m = re.search(p, raw, re.I)
         if m:
             name = normalize_spaces(m.group(1))
             break
+
+    # Plate/vehicle number is a strong signal that a driver block exists.
+    plate_match = None
     for p in PLATE_PATTERNS:
         m = re.search(p, raw, re.I)
         if m:
+            plate_match = m
             plate = m.group(1).upper().replace(" ", "")
             break
+
+    # Some dispatches use only 「姓名」 instead of 「司機/服務駕駛」.
+    # Only trust that 姓名 when it is in the few lines immediately before 車牌/車號.
+    if not name and plate_match:
+        before = raw[:plate_match.start()]
+        lines = [line.strip() for line in before.split("\n") if line.strip()]
+        nearby = lines[-5:]
+        for line in reversed(nearby):
+            m = re.match(r"^姓名\s*[：:]\s*(.+?)\s*$", line)
+            if m:
+                candidate = normalize_spaces(m.group(1))
+                if 1 < len(candidate) <= 20:
+                    name = candidate
+                break
+
     return name, plate
 
 
