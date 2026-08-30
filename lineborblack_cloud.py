@@ -100,7 +100,7 @@ ORDER_SHOW_UNASSIGNED = os.environ.get("ORDER_SHOW_UNASSIGNED", "false").lower()
 # V1.6.3 簡表密碼與管理員權限
 # 使用方式：簡表 9/2 9353、未派 9/2 9353
 SUMMARY_ACCESS_CODE = os.environ.get("SUMMARY_ACCESS_CODE", "9353").strip()
-SUMMARY_PRIVATE_ONLY = os.environ.get("SUMMARY_PRIVATE_ONLY", "true").lower() in {"1", "true", "yes", "on"}
+SUMMARY_PRIVATE_ONLY = False  # V1.6.5：簡表允許群組與私訊，僅以密碼控管
 
 # 只有這個 LINE User ID 可以查詢「誰曾經私訊過 Bot」。
 # 請先私訊 Bot 輸入「我的ID」，再把取得的 U... 填到 Render：
@@ -697,17 +697,7 @@ def handle_order_v1_command(event, text):
     if cmd["command"] in {"summary", "summary_unassigned"}:
         action_name = "未派簡表查詢" if cmd["command"] == "summary_unassigned" else "完整簡表查詢"
 
-        if SUMMARY_PRIVATE_ONLY and not _is_private_line_chat(event):
-            try:
-                _record_bot_usage(event, action_name, "群組阻擋")
-            except Exception:
-                pass
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="簡表屬機密資料，請私訊 Bot 查詢。")
-            )
-            return True
-
+        # V1.6.5：群組與私訊都可查簡表，只驗證密碼，不再限制必須私訊。
         if not _summary_password_ok(raw_text):
             try:
                 _record_bot_usage(event, action_name, "密碼錯誤")
