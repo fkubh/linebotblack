@@ -13,7 +13,7 @@ time, passenger count and current dispatch state.
 
 from __future__ import annotations
 
-PARSER_VERSION = "V1.6.5-20260831-group-password-summary"
+PARSER_VERSION = "V1.6.6-20260831-dispatch-fix"
 
 import argparse
 import html
@@ -250,10 +250,10 @@ def merge_sheet_and_line_orders(sheet_orders: list[Order], line_store: Optional[
 
 
 DRIVER_NAME_PATTERNS = (
-    r"(?:服務駕駛|司機姓名|駕駛姓名|司機|駕駛)\s*[：:]\s*([^\n\r，,]{2,20})",
+    r"(?:服務駕駛|司機姓名|駕駛姓名|司機|駕駛)\s*[：:；;]\s*([^\n\r，,]{2,20})",
 )
 PLATE_PATTERNS = (
-    r"(?:車號|車牌|車牌號碼)\s*[：:]\s*([A-Z0-9]{2,5}-?[A-Z0-9]{2,5})",
+    r"(?:車號|車牌|車牌號碼)\s*[：:；;]\s*([A-Z0-9]{2,5}-?[A-Z0-9]{2,5})",
 )
 
 
@@ -294,7 +294,7 @@ def extract_driver_info(text: str) -> tuple[str, str]:
         lines = [line.strip() for line in before.split("\n") if line.strip()]
         nearby = lines[-5:]
         for line in reversed(nearby):
-            m = re.match(r"^姓名\s*[：:]\s*(.+?)\s*$", line)
+            m = re.match(r"^姓名\s*[：:；;]\s*(.+?)\s*$", line)
             if m:
                 candidate = normalize_spaces(m.group(1))
                 if 1 < len(candidate) <= 20:
@@ -766,6 +766,16 @@ def status_for(order: Order, events: list[Event]) -> tuple[str, dict[str, Any]]:
             state["driver_name"] = ""
             state["plate"] = ""
             state["driver_change_count"] += 1
+
+            # V1.6.6：舊版若收到「換司機改帳號」＋完整司機資料，
+            # 事件雖被記成 driver_change，但其實新司機已經派出。
+            # 從既有事件 note 補抓司機，讓舊紀錄不用重貼也能恢復成已派。
+            note_driver_name, note_plate = extract_driver_info(e.note or "")
+            if note_driver_name or note_plate:
+                state["assigned"] = True
+                state["driver_name"] = note_driver_name
+                state["plate"] = note_plate
+                state["assigned_count"] += 1
         elif et == "edited":
             state["edit_count"] += 1
         elif et == "cancelled":
@@ -779,6 +789,16 @@ def status_for(order: Order, events: list[Event]) -> tuple[str, dict[str, Any]]:
             state["conflict"] = True
         elif et == "conflict_resolved":
             state["conflict"] = False
+
+    # V1.6.6：有些已派訊息是「完整訂單 + 姓名/電話/車號/車型」，
+    # 舊版若車號用了「；」會漏掉 assigned event。直接從 LINE 訂單原文補判斷。
+    if not state["cancelled"] and not state["assigned"]:
+        raw_driver_name, raw_plate = extract_driver_info(order.raw_text or "")
+        if raw_driver_name or raw_plate:
+            state["assigned"] = True
+            state["driver_name"] = raw_driver_name
+            state["plate"] = raw_plate
+            state["assigned_count"] += 1
 
     if state["cancelled"]:
         return "取消", state

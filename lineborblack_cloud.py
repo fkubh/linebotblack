@@ -562,6 +562,7 @@ def capture_line_activity(event, text):
     oid_match = re.search(r"\b(?:\d{2}KK\d{9}|ORD\d{10}|[A-Z]{3}\d{6})\b", text, re.I)
     oid = full_order.order_id if full_order else (oid_match.group(0).upper() if oid_match else "")
     alias_event = detect_line_event_alias(text)
+    detected_driver_name, detected_plate = extract_driver_info(text)
 
     if full_order:
         existing_line = line_order_store.get(full_order.order_id)
@@ -629,7 +630,7 @@ def capture_line_activity(event, text):
                 note=text[:500],
             ))
 
-        driver_name, plate = extract_driver_info(text)
+        driver_name, plate = detected_driver_name, detected_plate
         if driver_name or plate:
             events = _events_for_order_id(full_order.order_id)
             active_name = ""
@@ -672,6 +673,19 @@ def capture_line_activity(event, text):
             at=now,
             note=text[:500],
         ))
+
+        # V1.6.6：「訂單號 + 新司機資料 + 換司機」代表換司機後已重新派出，
+        # 不可以停在「改司機・未派」。
+        if detected_driver_name or detected_plate:
+            _add_event(Event(
+                order_id=oid,
+                event_type="assigned",
+                at=now,
+                driver_name=detected_driver_name,
+                plate=detected_plate,
+                note="由訂單號＋司機資料自動辨識為已派",
+            ))
+
         try:
             alias_label = {
                 "cancelled": "訂單取消",
@@ -680,6 +694,23 @@ def capture_line_activity(event, text):
                 "edited": "訂單修正",
             }.get(alias_event, "訂單異動")
             _record_bot_usage(event, alias_label)
+        except Exception:
+            pass
+        return True
+
+    # V1.6.6：像「MKJ423828 + 姓名/車號」這種沒有重貼完整訂單的派車格式，
+    # 只要有有效訂單號與司機資料，也直接記成已派。
+    if oid and (detected_driver_name or detected_plate):
+        _add_event(Event(
+            order_id=oid,
+            event_type="assigned",
+            at=now,
+            driver_name=detected_driver_name,
+            plate=detected_plate,
+            note="由訂單號＋司機資料自動辨識為已派",
+        ))
+        try:
+            _record_bot_usage(event, "訂單號＋司機資料派車")
         except Exception:
             pass
         return True
