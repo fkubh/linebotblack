@@ -13,7 +13,7 @@ time, passenger count and current dispatch state.
 
 from __future__ import annotations
 
-PARSER_VERSION = "V1.5-20260828-fix3"
+PARSER_VERSION = "V1.6-20260831-line-merge"
 
 import argparse
 import html
@@ -124,6 +124,216 @@ class EventStore:
             matched.append(event)
         return sorted(matched, key=lambda e: e.at)
 
+
+
+@dataclass
+class LineOrderRecord:
+    order: Order
+    updated_at: str
+    mode: str = "line_added"
+
+
+class LineOrderStore:
+    """Persist LINE-only or LINE-corrected full orders as JSON."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.records: dict[str, LineOrderRecord] = {}
+        self.load()
+
+    def load(self) -> None:
+        if not self.path.exists():
+            self.records = {}
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            self.records = {}
+            return
+        records: dict[str, LineOrderRecord] = {}
+        for key, item in (data or {}).items():
+            try:
+                order = Order(**item["order"])
+                records[key.upper()] = LineOrderRecord(
+                    order=order,
+                    updated_at=item.get("updated_at", ""),
+                    mode=item.get("mode", "line_added"),
+                )
+            except Exception:
+                continue
+        self.records = records
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            key: {
+                "order": asdict(rec.order),
+                "updated_at": rec.updated_at,
+                "mode": rec.mode,
+            }
+            for key, rec in self.records.items()
+        }
+        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def get(self, order_id: str) -> Optional[LineOrderRecord]:
+        return self.records.get((order_id or "").upper())
+
+    def upsert(self, order: Order, updated_at: str, mode: str = "line_added") -> None:
+        self.records[order.order_id.upper()] = LineOrderRecord(order=order, updated_at=updated_at, mode=mode)
+        self.save()
+
+    def all_orders(self) -> list[Order]:
+        return [rec.order for rec in self.records.values()]
+
+
+def parse_line_order_text(text: str) -> Optional[Order]:
+    raw = html.unescape(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if "出發日期" not in raw or "乘車人數" not in raw:
+        return None
+    oid = extract_order_id(raw)
+    if not oid:
+        return None
+    order = parse_order_row([raw, oid, "", "LINE"], 0)
+    if not order or not order.date or not order.trip_type:
+        return None
+    order.source_tag = ""
+    order.instance_key = f"{order.order_id}#LINE"
+    order.source_row = 0
+    return order
+
+
+def _norm_compare(text: str) -> str:
+    return re.sub(r"\s+", "", html.unescape(text or "")).replace("臺", "台").lower()
+
+
+def order_core_signature(order: Order) -> tuple:
+    return (
+        order.date,
+        order.trip_type,
+        order.time,
+        int(order.pax or 0),
+        _norm_compare(order.pickup),
+        _norm_compare(order.dropoff),
+        order.vehicle_tag,
+        tuple(order.extra_tags),
+        _norm_compare(order.flight),
+    )
+
+
+def orders_core_equal(a: Order, b: Order) -> bool:
+    return order_core_signature(a) == order_core_signature(b)
+
+
+def merge_sheet_and_line_orders(sheet_orders: list[Order], line_store: Optional[LineOrderStore]) -> list[Order]:
+    if line_store is None:
+        return list(sheet_orders)
+
+    result = list(sheet_orders)
+    by_id: dict[str, list[int]] = {}
+    for i, order in enumerate(result):
+        by_id.setdefault(order.order_id.upper(), []).append(i)
+
+    for rec in line_store.records.values():
+        lo = rec.order
+        idxs = by_id.get(lo.order_id.upper(), [])
+        if not idxs:
+            by_id.setdefault(lo.order_id.upper(), []).append(len(result))
+            result.append(lo)
+            continue
+        if len(idxs) == 1:
+            idx = idxs[0]
+            original = result[idx]
+            lo.instance_key = original.instance_key
+            lo.source_tag = original.source_tag
+            result[idx] = lo
+    return result
+
+
+DRIVER_NAME_PATTERNS = (
+    r"(?:司機姓名|駕駛姓名|司機|駕駛)\s*[：:]\s*([^\n\r，,]{2,20})",
+)
+PLATE_PATTERNS = (
+    r"(?:車號|車牌|車牌號碼)\s*[：:]\s*([A-Z0-9]{2,5}-?[A-Z0-9]{2,5})",
+)
+
+
+def extract_driver_info(text: str) -> tuple[str, str]:
+    raw = text or ""
+    name = ""
+    plate = ""
+    for p in DRIVER_NAME_PATTERNS:
+        m = re.search(p, raw, re.I)
+        if m:
+            name = normalize_spaces(m.group(1))
+            break
+    for p in PLATE_PATTERNS:
+        m = re.search(p, raw, re.I)
+        if m:
+            plate = m.group(1).upper().replace(" ", "")
+            break
+    return name, plate
+
+
+LINE_EVENT_ALIASES = {
+    "recalled": ("拉回改派", "拉回", "改派"),
+    "cancelled": ("訂單取消", "取消"),
+    "driver_change": ("換司機", "改司機"),
+    "edited": ("延期", "改時間", "改地址", "更換車款", "改航班", "訂單修正"),
+}
+
+
+def detect_line_event_alias(text: str) -> Optional[str]:
+    compact = normalize_spaces(text)
+    for event_type in ("cancelled", "driver_change", "recalled", "edited"):
+        if any(alias in compact for alias in LINE_EVENT_ALIASES[event_type]):
+            return event_type
+    return None
+
+
+def generate_unassigned_summary(
+    orders: list[Order],
+    target_date: str,
+    event_store: Optional[EventStore] = None,
+) -> str:
+    target = extract_date(target_date) or target_date.strip()
+    selected: list[tuple[Order, list[Event], str, dict[str, Any]]] = []
+
+    for base_order in orders:
+        events = event_store.for_order(base_order) if event_store else []
+        order = effective_order(base_order, events)
+        if order.date != target:
+            continue
+        status, state = status_for(order, events)
+        if state.get("cancelled") or state.get("assigned"):
+            continue
+        selected.append((order, events, status, state))
+
+    selected.sort(key=lambda pair: (
+        pair[0].trip_type != "送機",
+        pair[0].time or "9999",
+        pair[0].order_id,
+        pair[0].instance_key,
+    ))
+
+    groups = {"送機": [], "接機": []}
+    for order, events, status, state in selected:
+        groups.setdefault(order.trip_type or "其他", []).append(
+            summary_line(order, status, show_unassigned=True)
+        )
+
+    out = [f"{target} 未派簡表", ""]
+    count = 0
+    for group_name in ["送機", "接機", "其他"]:
+        lines = groups.get(group_name, [])
+        if not lines:
+            continue
+        count += len(lines)
+        out.append(group_name)
+        out.extend(lines)
+        out.append("")
+    if count == 0:
+        out.append("目前沒有未派訂單")
+    return "\n".join(out).rstrip()
 
 def normalize_spaces(text: str) -> str:
     return re.sub(r"[ \t\u3000]+", " ", (text or "").strip())
@@ -499,10 +709,18 @@ def status_for(order: Order, events: list[Event]) -> tuple[str, dict[str, Any]]:
         "assigned_count": 0,
         "recall_count": 0,
         "edit_count": 0,
+        "driver_change_count": 0,
+        "conflict": False,
     }
+
     for e in events:
         et = e.event_type.lower()
         if et == "assigned":
+            if state["assigned"] and (
+                (e.driver_name and state["driver_name"] and e.driver_name != state["driver_name"])
+                or (e.plate and state["plate"] and e.plate != state["plate"])
+            ):
+                state["driver_change_count"] += 1
             state["assigned"] = True
             state["driver_name"] = e.driver_name
             state["plate"] = e.plate
@@ -513,27 +731,44 @@ def status_for(order: Order, events: list[Event]) -> tuple[str, dict[str, Any]]:
             state["driver_name"] = ""
             state["plate"] = ""
             state["recall_count"] += 1
+        elif et == "driver_change":
+            state["assigned"] = False
+            state["driver_name"] = ""
+            state["plate"] = ""
+            state["driver_change_count"] += 1
         elif et == "edited":
             state["edit_count"] += 1
         elif et == "cancelled":
             state["cancelled"] = True
             state["assigned"] = False
+            state["driver_name"] = ""
+            state["plate"] = ""
         elif et == "restored":
             state["cancelled"] = False
+        elif et == "conflict":
+            state["conflict"] = True
+        elif et == "conflict_resolved":
+            state["conflict"] = False
 
     if state["cancelled"]:
         return "取消", state
-    reassigned = state["assigned"] and state["assigned_count"] >= 2 and state["recall_count"] >= 1
+    if state["conflict"]:
+        return "資料衝突", state
+
     edited = state["edit_count"] > 0
-    if reassigned and edited:
-        return "異動・重派・已派", state
-    if reassigned:
-        return "重派・已派", state
+    changed = state["driver_change_count"] > 0
+
+    if changed and state["assigned"]:
+        return ("異動・改司機・已派" if edited else "改司機・已派"), state
+    if changed and not state["assigned"]:
+        return ("異動・改司機・未派" if edited else "改司機・未派"), state
     if edited and state["assigned"]:
         return "異動・已派", state
     if edited:
         return "異動・未派", state
     if state["assigned"]:
+        if state["assigned_count"] >= 2 and state["recall_count"] >= 1:
+            return "重派・已派", state
         return "已派", state
     return "未派", state
 
@@ -667,42 +902,63 @@ def load_rows_from_xlsx(path: str | Path, sheet_name: str) -> list[list[str]]:
 
 
 def parse_line_command(text: str) -> Optional[dict[str, str]]:
-    """Parse deterministic V1 LINE commands.
-
-    Supported:
-      派車 KBM318185 王小明 ABC-1234
-      拉回 KBM318185 班機延誤
-      取消 KBM318185 客人取消
-      恢復 KBM318185
-      異動 KBM318185 班機延誤 10:25→11:40
-      歷程 KBM318185
-      簡表 2/1
-    """
+    """Deterministic LINE commands for V1.6."""
     text = normalize_spaces(text)
-    m = re.match(r"^(派車|拉回|取消|恢復|異動|歷程|簡表)\s+(.+)$", text)
+
+    m = re.match(r"^(簡表|未派)\s+(.+)$", text)
+    if m:
+        return {
+            "command": "summary_unassigned" if m.group(1) == "未派" else "summary",
+            "date": m.group(2).strip(),
+        }
+
+    m = re.match(
+        r"^(派車|拉回改派|拉回|改派|取消|訂單取消|恢復|異動|延期|改時間|改地址|更換車款|改航班|訂單修正|換司機|改司機|歷程)\s+(.+)$",
+        text,
+    )
     if not m:
         return None
+
     command, rest = m.group(1), m.group(2).strip()
-    if command == "簡表":
-        return {"command": "summary", "date": rest}
     oid_m = ORDER_ID_RE.search(rest)
     if not oid_m:
         return None
     oid = oid_m.group(0).upper()
     tail = normalize_spaces(rest[oid_m.end():])
+
+    if command == "歷程":
+        return {"command": "history", "order_id": oid}
+
     if command == "派車":
         parts = tail.split(" ") if tail else []
         return {
-            "command": "event", "event_type": "assigned", "order_id": oid,
+            "command": "event",
+            "event_type": "assigned",
+            "order_id": oid,
             "driver_name": parts[0] if parts else "",
             "plate": parts[1] if len(parts) > 1 else "",
             "note": " ".join(parts[2:]) if len(parts) > 2 else "",
         }
-    mapping = {"拉回": "recalled", "取消": "cancelled", "恢復": "restored", "異動": "edited"}
-    if command == "歷程":
-        return {"command": "history", "order_id": oid}
-    changes = parse_change_note(tail) if command == "異動" else {}
-    return {"command": "event", "event_type": mapping[command], "order_id": oid, "note": tail, "changes": changes}
+
+    if command in {"拉回改派", "拉回", "改派"}:
+        event_type = "recalled"
+    elif command in {"取消", "訂單取消"}:
+        event_type = "cancelled"
+    elif command in {"換司機", "改司機"}:
+        event_type = "driver_change"
+    elif command == "恢復":
+        event_type = "restored"
+    else:
+        event_type = "edited"
+
+    changes = parse_change_note(tail) if event_type == "edited" else {}
+    return {
+        "command": "event",
+        "event_type": event_type,
+        "order_id": oid,
+        "note": tail,
+        "changes": changes,
+    }
 
 
 def _cli() -> None:
