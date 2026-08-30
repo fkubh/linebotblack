@@ -559,7 +559,7 @@ def capture_line_activity(event, text):
     """
     now = _taipei_now_iso()
     full_order = parse_line_order_text(text)
-    oid_match = re.search(r"\b(?:\d{2}KK\d{9}|ORD\d{10}|[A-Z]{3}\d{6})\b", text, re.I)
+    oid_match = re.search(r"\b(?:\d{2}KK\d{9}|ORD\d{10}|[A-Z]{3}\d{6}|[A-Z]{2}\d{2}[A-Z]\d{4})\b", text, re.I)
     oid = full_order.order_id if full_order else (oid_match.group(0).upper() if oid_match else "")
     alias_event = detect_line_event_alias(text)
     detected_driver_name, detected_plate = extract_driver_info(text)

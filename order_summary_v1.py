@@ -13,7 +13,7 @@ time, passenger count and current dispatch state.
 
 from __future__ import annotations
 
-PARSER_VERSION = "V1.6.6-20260831-dispatch-fix"
+PARSER_VERSION = "V1.6.8-20260831-child-seat-fix"
 
 import argparse
 import html
@@ -32,7 +32,7 @@ FIELD_LABELS = [
     "其他備註", "聯絡人", "電話", "結算價", "客收", "費用",
 ]
 FIELD_RE = re.compile(r"^\s*(%s)\s*[：:]\s*(.*)$" % "|".join(map(re.escape, FIELD_LABELS)))
-ORDER_ID_RE = re.compile(r"\b(?:\d{2}KK\d{9}|ORD\d{10}|[A-Z]{3}\d{6})\b", re.I)
+ORDER_ID_RE = re.compile(r"\b(?:\d{2}KK\d{9}|ORD\d{10}|[A-Z]{3}\d{6}|[A-Z]{2}\d{2}[A-Z]\d{4})\b", re.I)
 DATE_RE = re.compile(r"(?<!\d)(\d{1,2})\s*/\s*(\d{1,2})(?!\d)")
 TIME_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3])\s*[:：]\s*([0-5]\d)(?!\d)")
 
@@ -573,7 +573,7 @@ def extra_tags(fields: dict[str, str]) -> list[str]:
         return ["增高墊"]
 
     seat_pattern = (
-        r"嬰兒座椅|兒童安全座椅|向後式嬰兒安全座椅|向後式座椅|"
+        r"嬰兒座椅|兒童座椅|兒童安全座椅|向後式嬰兒安全座椅|向後式座椅|"
         r"前向式安全座椅|安全座椅|汽座"
     )
     if re.search(seat_pattern, compact, re.I):
@@ -612,6 +612,10 @@ def parse_order_row(row: list[str], row_number: int) -> Optional[Order]:
     trip = detect_trip_type(raw, fields)
     date = extract_date(fields.get("出發日期", ""))
     source_tag = str(row[3]).strip() if len(row) > 3 else ""
+    # V1.6.7：像「更新----／更新」是工作表人工註記，不是重複訂單來源標籤。
+    # 避免簡表出現 CR01M3898(更新----)。
+    if re.match(r"^更新(?:[-—–_\s]*)$", source_tag):
+        source_tag = ""
     instance_key = f"{oid}#{source_tag}" if source_tag else f"{oid}#R{row_number}"
     return Order(
         order_id=oid,
@@ -827,7 +831,16 @@ def compact_tags(order: Order) -> str:
     tags = []
     if order.vehicle_tag:
         tags.append(order.vehicle_tag)
-    tags.extend(order.extra_tags)
+
+    # V1.6.8：重新依原始備註補算座椅標籤。
+    # 這樣舊版已存進 line_orders_v1.json 的訂單，也不用重新貼單就能補出「安椅」。
+    live_extra_tags = extra_tags({"其他備註": order.notes or ""})
+    merged_extra_tags = list(order.extra_tags or [])
+    for tag in live_extra_tags:
+        if tag not in merged_extra_tags:
+            merged_extra_tags.append(tag)
+
+    tags.extend(merged_extra_tags)
     return f"【{'+'.join(tags)}】" if tags else ""
 
 
