@@ -96,9 +96,81 @@ ORDER_LINE_ORDERS_PATH = os.environ.get("ORDER_LINE_ORDERS_PATH", "line_orders_v
 ORDER_SHEET_MAX_COL = os.environ.get("ORDER_SHEET_MAX_COL", "H")
 ORDER_SHEET_TAB_TEMPLATE = os.environ.get("ORDER_SHEET_TAB_TEMPLATE", "{year}/{month}月")
 ORDER_SHOW_UNASSIGNED = os.environ.get("ORDER_SHOW_UNASSIGNED", "false").lower() in {"1", "true", "yes", "on"}
+
+# 簡表機密權限
+SUMMARY_ALLOWED_USER_IDS_RAW = os.environ.get("SUMMARY_ALLOWED_USER_IDS", "")
+SUMMARY_ALLOWED_USER_IDS = {
+    item.strip()
+    for item in re.split(r"[,\s;]+", SUMMARY_ALLOWED_USER_IDS_RAW)
+    if item.strip()
+}
+SUMMARY_PRIVATE_ONLY = os.environ.get("SUMMARY_PRIVATE_ONLY", "true").lower() in {"1", "true", "yes", "on"}
 order_event_store = EventStore(ORDER_EVENTS_PATH)
 line_order_store = LineOrderStore(ORDER_LINE_ORDERS_PATH)
 
+
+
+def _line_user_id(event):
+    source = getattr(event, "source", None)
+    return (getattr(source, "user_id", "") or "").strip() if source else ""
+
+
+def _line_source_type(event):
+    source = getattr(event, "source", None)
+    if source is None:
+        return ""
+    source_type = (getattr(source, "type", "") or "").strip().lower()
+    if source_type:
+        return source_type
+    if getattr(source, "group_id", ""):
+        return "group"
+    if getattr(source, "room_id", ""):
+        return "room"
+    if getattr(source, "user_id", ""):
+        return "user"
+    return ""
+
+
+def _is_private_line_chat(event):
+    return _line_source_type(event) == "user"
+
+
+def _summary_access_allowed(event):
+    user_id = _line_user_id(event)
+    if SUMMARY_PRIVATE_ONLY and not _is_private_line_chat(event):
+        return False, "private_only"
+    if not user_id or user_id not in SUMMARY_ALLOWED_USER_IDS:
+        return False, "not_allowed"
+    return True, "ok"
+
+
+def _my_line_identity_text(event):
+    user_id = _line_user_id(event)
+    if not user_id:
+        return "目前無法取得你的 LINE User ID。"
+
+    display_name = ""
+    try:
+        profile = line_bot_api.get_profile(user_id)
+        display_name = getattr(profile, "display_name", "") or ""
+    except Exception as exc:
+        app.logger.info("取得 LINE Profile 失敗：%s", exc)
+
+    source_type = _line_source_type(event)
+    source_text = {
+        "user": "私訊",
+        "group": "群組",
+        "room": "聊天室",
+    }.get(source_type, source_type or "未知")
+
+    lines = ["你的 LINE 資料："]
+    if display_name:
+        lines.append(f"顯示名稱：{display_name}")
+    lines.append(f"User ID：{user_id}")
+    lines.append(f"目前來源：{source_text}")
+    lines.append("")
+    lines.append("簡表權限：✅ 已授權" if user_id in SUMMARY_ALLOWED_USER_IDS else "簡表權限：❌ 尚未授權")
+    return "\n".join(lines)
 
 def _taipei_now_iso():
     return datetime.now(ZoneInfo("Asia/Taipei")).isoformat(timespec="minutes")
@@ -407,6 +479,24 @@ def handle_order_v1_command(event, text):
     cmd = parse_line_command(text)
     if not cmd:
         return False
+
+    # V1.6.2：完整簡表與未派簡表都屬機密資料。
+    if cmd["command"] in {"summary", "summary_unassigned"}:
+        allowed, reason = _summary_access_allowed(event)
+        if not allowed:
+            if reason == "private_only":
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="簡表屬機密資料，請私訊 Bot 查詢。")
+                )
+            else:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(
+                        text="無權限使用簡表功能。\n請先私訊 Bot 輸入「我的ID」取得你的 LINE User ID。"
+                    )
+                )
+            return True
 
     try:
         if cmd["command"] in {"summary", "summary_unassigned"}:
@@ -1064,6 +1154,24 @@ def callback():
 def handle_message(event):
 
     text = event.message.text.strip()
+
+    # V1.6.2：查看自己的 LINE User ID / 簡表授權狀態。
+    if text in {"我的ID", "我的id", "我的 Id", "我的權限", "權限"}:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=_my_line_identity_text(event))
+        )
+        return
+
+    # Render log 只記錄互動者 User ID 與來源，不保存訊息內容。
+    try:
+        app.logger.info(
+            "LINE互動 user_id=%s source=%s",
+            _line_user_id(event) or "(unknown)",
+            _line_source_type(event) or "(unknown)",
+        )
+    except Exception:
+        pass
 
     # 訂單解析器版本檢查：可在 LINE 輸入「版本」確認 Render 目前實際載入哪一版。
     if text in {"版本", "訂單版本", "parser version"}:
