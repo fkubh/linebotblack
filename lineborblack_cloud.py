@@ -2,7 +2,7 @@ import os
 import re
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
 
@@ -106,6 +106,13 @@ BOT_RECORD_SHEET_ID = os.environ.get(
 BOT_EVENT_TAB = os.environ.get("BOT_EVENT_TAB", "訂單事件").strip() or "訂單事件"
 BOT_LINE_ORDER_TAB = os.environ.get("BOT_LINE_ORDER_TAB", "LINE訂單").strip() or "LINE訂單"
 
+# V1.6.10：只有包車群＋測試群可寫入 LINE 訂單／調度狀態。
+# 先部署後在兩群輸入「群組ID」取得 ID，再填入 Render 環境變數。
+PACKAGE_GROUP_ID = os.environ.get("PACKAGE_GROUP_ID", "").strip()
+TEST_GROUP_ID = os.environ.get("TEST_GROUP_ID", "").strip()
+BOT_RECORD_RETENTION_DAYS = int(os.environ.get("BOT_RECORD_RETENTION_DAYS", "60"))
+_cleanup_state = {"last_run": None}
+
 # V1.6.3 簡表密碼與管理員權限
 # 使用方式：簡表 9/2 9353、未派 9/2 9353
 SUMMARY_ACCESS_CODE = os.environ.get("SUMMARY_ACCESS_CODE", "9353").strip()
@@ -143,6 +150,25 @@ def _line_source_type(event):
     if getattr(source, "user_id", ""):
         return "user"
     return ""
+
+
+def _line_group_id(event):
+    source = getattr(event, "source", None)
+    return (getattr(source, "group_id", "") or "").strip() if source else ""
+
+
+def _authorized_order_group_ids():
+    return {gid for gid in (PACKAGE_GROUP_ID, TEST_GROUP_ID) if gid}
+
+
+def _is_authorized_order_source(event):
+    """V1.6.10：LINE 訂單/派車狀態只接受包車群與測試群。"""
+    if _line_source_type(event) != "group":
+        return False
+    gid = _line_group_id(event)
+    allowed = _authorized_order_group_ids()
+    # 尚未填 Group ID 時先進入設定模式：不寫訂單，避免誤收其他群資料。
+    return bool(allowed and gid in allowed)
 
 
 def _is_private_line_chat(event):
@@ -461,6 +487,46 @@ def _sheet_append(spreadsheet_id, tab_name, values):
     response.raise_for_status()
 
 
+def _sheet_clear(spreadsheet_id, range_name):
+    encoded_range = quote(range_name, safe="")
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
+        f"{encoded_range}:clear"
+    )
+    response = requests.post(url, headers=_google_headers(), json={}, timeout=15)
+    response.raise_for_status()
+
+
+def _sheet_write_rows(spreadsheet_id, start_range, rows):
+    if not rows:
+        return
+    encoded_range = quote(start_range, safe="")
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
+        f"{encoded_range}?valueInputOption=RAW"
+    )
+    response = requests.put(
+        url, headers=_google_headers(),
+        json={"majorDimension": "ROWS", "values": rows}, timeout=15,
+    )
+    response.raise_for_status()
+
+
+def _parse_record_time(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(text, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ZoneInfo("Asia/Taipei"))
+            return dt.astimezone(ZoneInfo("Asia/Taipei"))
+        except ValueError:
+            pass
+    return None
+
+
 class GoogleSheetEventStore:
     HEADERS = [
         "order_id", "event_type", "at", "driver_name", "plate",
@@ -510,6 +576,25 @@ class GoogleSheetEventStore:
             ],
         )
         self.events.append(event)
+
+    def cleanup_older_than(self, cutoff):
+        kept = []
+        for event in self.events:
+            dt = _parse_record_time(event.at)
+            # 無法辨識日期的舊資料保留，避免誤刪。
+            if dt is None or dt >= cutoff:
+                kept.append(event)
+        if len(kept) == len(self.events):
+            return 0
+        rows = [[
+            e.order_id, e.event_type, e.at, e.driver_name, e.plate, e.note,
+            e.instance_key, json.dumps(e.changes or {}, ensure_ascii=False, separators=(",", ":")),
+        ] for e in kept]
+        _sheet_clear(self.spreadsheet_id, f"'{self.tab_name}'!A2:H")
+        _sheet_write_rows(self.spreadsheet_id, f"'{self.tab_name}'!A2", rows)
+        removed = len(self.events) - len(kept)
+        self.events = kept
+        return removed
 
     def for_order(self, order):
         matched = []
@@ -571,8 +656,39 @@ class GoogleSheetLineOrderStore:
             order=order, updated_at=updated_at, mode=mode
         )
 
+    def cleanup_older_than(self, cutoff):
+        rows = _sheet_values(self.spreadsheet_id, f"'{self.tab_name}'!A2:D")
+        kept_rows = []
+        for row in rows:
+            row = list(row) + [""] * (4 - len(row))
+            dt = _parse_record_time(row[1])
+            if dt is None or dt >= cutoff:
+                kept_rows.append(row[:4])
+        if len(kept_rows) == len(rows):
+            return 0
+        _sheet_clear(self.spreadsheet_id, f"'{self.tab_name}'!A2:D")
+        _sheet_write_rows(self.spreadsheet_id, f"'{self.tab_name}'!A2", kept_rows)
+        removed = len(rows) - len(kept_rows)
+        self.load()
+        return removed
+
     def all_orders(self):
         return [rec.order for rec in self.records.values()]
+
+
+def _cleanup_google_sheet_records(force=False):
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    last = _cleanup_state.get("last_run")
+    if not force and last and now - last < timedelta(hours=24):
+        return
+    cutoff = now - timedelta(days=max(1, BOT_RECORD_RETENTION_DAYS))
+    removed_events = order_event_store.cleanup_older_than(cutoff)
+    removed_line = line_order_store.cleanup_older_than(cutoff)
+    _cleanup_state["last_run"] = now
+    app.logger.info(
+        "V1.6.10 60天清理完成：cutoff=%s events_removed=%s line_rows_removed=%s",
+        cutoff.strftime("%Y-%m-%d %H:%M"), removed_events, removed_line,
+    )
 
 
 def _init_google_sheet_persistence():
@@ -582,10 +698,11 @@ def _init_google_sheet_persistence():
     order_event_store = GoogleSheetEventStore(BOT_RECORD_SHEET_ID, BOT_EVENT_TAB)
     line_order_store = GoogleSheetLineOrderStore(BOT_RECORD_SHEET_ID, BOT_LINE_ORDER_TAB)
     app.logger.info(
-        "V1.6.9 Bot永久紀錄已啟用：sheet=%s event_tab=%s line_tab=%s events=%s line_orders=%s",
+        "V1.6.10 Bot永久紀錄已啟用：sheet=%s event_tab=%s line_tab=%s events=%s line_orders=%s",
         BOT_RECORD_SHEET_ID, BOT_EVENT_TAB, BOT_LINE_ORDER_TAB,
         len(order_event_store.events), len(line_order_store.records),
     )
+    _cleanup_google_sheet_records(force=True)
 
 
 def _resolve_order_sheet_date(date_text):
@@ -755,9 +872,16 @@ def _sheet_orders_only_for_date(date_text):
 def capture_line_activity(event, text):
     """Capture full LINE orders and standardized order events.
 
+    V1.6.10: only the configured 包車群 / 測試群 may mutate order state.
     Returns True for standalone event messages so they do not fall through to
     unrelated blacklist matching.
     """
+    if not _is_authorized_order_source(event):
+        return False
+    try:
+        _cleanup_google_sheet_records()
+    except Exception as exc:
+        app.logger.warning("60天紀錄清理失敗（不影響本次訊息）：%s", exc)
     now = _taipei_now_iso()
     full_order = parse_line_order_text(text)
     oid_match = re.search(r"\b(?:\d{2}KK\d{9}|ORD\d{10}|[A-Z]{3}\d{6}|[A-Z]{2}\d{2}[A-Z]\d{4})\b", text, re.I)
@@ -1667,6 +1791,16 @@ def handle_message(event):
         )
     except Exception:
         pass
+
+    # V1.6.10：取得目前群組 Group ID。這個指令在尚未設定白名單前也能使用。
+    if text in {"群組ID", "群組id", "Group ID", "group id"}:
+        gid = _line_group_id(event)
+        if gid:
+            reply_text = f"目前群組 Group ID：\n{gid}"
+        else:
+            reply_text = "這裡不是 LINE 群組，請到『包車群』或『測試群』輸入：群組ID"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        return
 
     # 訂單解析器版本檢查：可在 LINE 輸入「版本」確認 Render 目前實際載入哪一版。
     if text in {"版本", "訂單版本", "parser version"}:

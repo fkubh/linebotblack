@@ -13,7 +13,7 @@ time, passenger count and current dispatch state.
 
 from __future__ import annotations
 
-PARSER_VERSION = "V1.6.9-20260831-google-sheet-persistence"
+PARSER_VERSION = "V1.6.10-20260831-group-filter-recall-cleanup"
 
 import argparse
 import html
@@ -305,7 +305,7 @@ def extract_driver_info(text: str) -> tuple[str, str]:
 
 
 LINE_EVENT_ALIASES = {
-    "recalled": ("拉回改派", "拉回", "改派"),
+    "recalled": ("收回改派", "拉回改派", "司機取消", "拉回", "收回", "改派"),
     "cancelled": ("訂單取消", "取消"),
     "driver_change": ("換司機", "改司機"),
     "edited": ("延期", "改時間", "改地址", "更換車款", "改航班", "訂單修正"),
@@ -314,7 +314,7 @@ LINE_EVENT_ALIASES = {
 
 def detect_line_event_alias(text: str) -> Optional[str]:
     compact = normalize_spaces(text)
-    for event_type in ("cancelled", "driver_change", "recalled", "edited"):
+    for event_type in ("recalled", "cancelled", "driver_change", "edited"):
         if any(alias in compact for alias in LINE_EVENT_ALIASES[event_type]):
             return event_type
     return None
