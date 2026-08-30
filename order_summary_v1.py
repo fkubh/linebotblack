@@ -13,7 +13,7 @@ time, passenger count and current dispatch state.
 
 from __future__ import annotations
 
-PARSER_VERSION = "V1.6.8-20260831-child-seat-fix"
+PARSER_VERSION = "V1.6.9-20260831-google-sheet-persistence"
 
 import argparse
 import html

@@ -80,7 +80,7 @@ try:
 except json.JSONDecodeError as exc:
     raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON 不是有效的 JSON") from exc
 
-GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 GOOGLE_CREDENTIALS = service_account.Credentials.from_service_account_info(
     GOOGLE_SERVICE_ACCOUNT_INFO,
     scopes=GOOGLE_SCOPES,
@@ -97,6 +97,15 @@ ORDER_SHEET_MAX_COL = os.environ.get("ORDER_SHEET_MAX_COL", "H")
 ORDER_SHEET_TAB_TEMPLATE = os.environ.get("ORDER_SHEET_TAB_TEMPLATE", "{year}/{month}月")
 ORDER_SHOW_UNASSIGNED = os.environ.get("ORDER_SHOW_UNASSIGNED", "false").lower() in {"1", "true", "yes", "on"}
 
+# V1.6.9：Render Free 沒有 Persistent Disk，因此把訂單狀態永久存到獨立 Google Sheet。
+# 可在 Render 用 BOT_RECORD_SHEET_ID 覆蓋；未設定時使用目前指定的 Bot 紀錄表。
+BOT_RECORD_SHEET_ID = os.environ.get(
+    "BOT_RECORD_SHEET_ID",
+    "1upIa52zC6J_UEDz700Lv2F-hlbgU_x7p-ZZfVfCND5M",
+).strip()
+BOT_EVENT_TAB = os.environ.get("BOT_EVENT_TAB", "訂單事件").strip() or "訂單事件"
+BOT_LINE_ORDER_TAB = os.environ.get("BOT_LINE_ORDER_TAB", "LINE訂單").strip() or "LINE訂單"
+
 # V1.6.3 簡表密碼與管理員權限
 # 使用方式：簡表 9/2 9353、未派 9/2 9353
 SUMMARY_ACCESS_CODE = os.environ.get("SUMMARY_ACCESS_CODE", "9353").strip()
@@ -108,6 +117,8 @@ SUMMARY_PRIVATE_ONLY = False  # V1.6.5：簡表允許群組與私訊，僅以密
 SUMMARY_ADMIN_USER_ID = os.environ.get("SUMMARY_ADMIN_USER_ID", "").strip()
 BOT_INTERACTIONS_PATH = os.environ.get("BOT_INTERACTIONS_PATH", "bot_interactions_v1.json")
 BOT_USAGE_PATH = os.environ.get("BOT_USAGE_PATH", "bot_usage_v1.json")
+# 啟動初期先建立相容物件；V1.6.9 在 Google Sheet helper 定義完成後
+# 會用永久 Google Sheet Store 取代。
 order_event_store = EventStore(ORDER_EVENTS_PATH)
 line_order_store = LineOrderStore(ORDER_LINE_ORDERS_PATH)
 
@@ -385,6 +396,196 @@ def _sheet_values(spreadsheet_id, range_name):
         app.logger.error("訂單 Google Sheets API 錯誤 %s：%s", response.status_code, response.text)
     response.raise_for_status()
     return response.json().get("values", [])
+
+
+
+def _google_headers():
+    if not GOOGLE_CREDENTIALS.valid:
+        GOOGLE_CREDENTIALS.refresh(GoogleAuthRequest())
+    return {
+        "Authorization": f"Bearer {GOOGLE_CREDENTIALS.token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+
+
+def _sheet_metadata(spreadsheet_id):
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}?fields=sheets.properties"
+    response = requests.get(url, headers=_google_headers(), timeout=15)
+    response.raise_for_status()
+    return response.json()
+
+
+def _ensure_sheet_tab(spreadsheet_id, tab_name, headers):
+    """不存在就自動建立分頁；空白分頁則自動補表頭。"""
+    meta = _sheet_metadata(spreadsheet_id)
+    titles = {
+        s.get("properties", {}).get("title", "")
+        for s in meta.get("sheets", [])
+    }
+    if tab_name not in titles:
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate"
+        payload = {"requests": [{"addSheet": {"properties": {"title": tab_name}}}]}
+        response = requests.post(url, headers=_google_headers(), json=payload, timeout=15)
+        response.raise_for_status()
+
+    existing = _sheet_values(spreadsheet_id, f"'{tab_name}'!A1:Z1")
+    if not existing:
+        encoded_range = quote(f"'{tab_name}'!A1", safe="")
+        url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
+            f"{encoded_range}?valueInputOption=RAW"
+        )
+        response = requests.put(
+            url,
+            headers=_google_headers(),
+            json={"range": f"'{tab_name}'!A1", "majorDimension": "ROWS", "values": [headers]},
+            timeout=15,
+        )
+        response.raise_for_status()
+
+
+def _sheet_append(spreadsheet_id, tab_name, values):
+    encoded_range = quote(f"'{tab_name}'!A:Z", safe="")
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
+        f"{encoded_range}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS"
+    )
+    response = requests.post(
+        url,
+        headers=_google_headers(),
+        json={"majorDimension": "ROWS", "values": [values]},
+        timeout=15,
+    )
+    if response.status_code >= 300:
+        app.logger.error("Bot紀錄 Google Sheets 寫入失敗 %s：%s", response.status_code, response.text)
+    response.raise_for_status()
+
+
+class GoogleSheetEventStore:
+    HEADERS = [
+        "order_id", "event_type", "at", "driver_name", "plate",
+        "note", "instance_key", "changes_json",
+    ]
+
+    def __init__(self, spreadsheet_id, tab_name):
+        self.spreadsheet_id = spreadsheet_id
+        self.tab_name = tab_name
+        self.events = []
+        _ensure_sheet_tab(spreadsheet_id, tab_name, self.HEADERS)
+        self.load()
+
+    def load(self):
+        rows = _sheet_values(self.spreadsheet_id, f"'{self.tab_name}'!A2:H")
+        events = []
+        for row in rows:
+            row = list(row) + [""] * (8 - len(row))
+            if not str(row[0]).strip():
+                continue
+            try:
+                changes = json.loads(row[7]) if str(row[7]).strip() else {}
+                if not isinstance(changes, dict):
+                    changes = {}
+            except Exception:
+                changes = {}
+            events.append(Event(
+                order_id=str(row[0]).strip(),
+                event_type=str(row[1]).strip(),
+                at=str(row[2]).strip(),
+                driver_name=str(row[3]).strip(),
+                plate=str(row[4]).strip(),
+                note=str(row[5]),
+                instance_key=str(row[6]).strip(),
+                changes=changes,
+            ))
+        self.events = events
+
+    def add(self, event):
+        _sheet_append(
+            self.spreadsheet_id,
+            self.tab_name,
+            [
+                event.order_id, event.event_type, event.at, event.driver_name,
+                event.plate, event.note, event.instance_key,
+                json.dumps(event.changes or {}, ensure_ascii=False, separators=(",", ":")),
+            ],
+        )
+        self.events.append(event)
+
+    def for_order(self, order):
+        matched = []
+        for event in self.events:
+            if event.order_id.upper() != order.order_id.upper():
+                continue
+            if event.instance_key and event.instance_key != order.instance_key:
+                continue
+            matched.append(event)
+        return sorted(matched, key=lambda e: e.at)
+
+
+class GoogleSheetLineOrderStore:
+    HEADERS = ["order_id", "updated_at", "mode", "order_json"]
+
+    def __init__(self, spreadsheet_id, tab_name):
+        self.spreadsheet_id = spreadsheet_id
+        self.tab_name = tab_name
+        self.records = {}
+        _ensure_sheet_tab(spreadsheet_id, tab_name, self.HEADERS)
+        self.load()
+
+    def load(self):
+        rows = _sheet_values(self.spreadsheet_id, f"'{self.tab_name}'!A2:D")
+        records = {}
+        from order_summary_v1 import Order, LineOrderRecord
+        for row in rows:
+            row = list(row) + [""] * (4 - len(row))
+            oid = str(row[0]).strip().upper()
+            if not oid or not str(row[3]).strip():
+                continue
+            try:
+                payload = json.loads(row[3])
+                order = Order(**payload)
+                rec = LineOrderRecord(
+                    order=order,
+                    updated_at=str(row[1]).strip(),
+                    mode=str(row[2]).strip() or "line_added",
+                )
+                # append-only：同一訂單號以最後一列為最新版
+                records[oid] = rec
+            except Exception as exc:
+                app.logger.warning("略過無法解析的 LINE訂單 永久紀錄 %s：%s", oid, exc)
+        self.records = records
+
+    def get(self, order_id):
+        return self.records.get((order_id or "").upper())
+
+    def upsert(self, order, updated_at, mode="line_added"):
+        from dataclasses import asdict
+        from order_summary_v1 import LineOrderRecord
+        payload = json.dumps(asdict(order), ensure_ascii=False, separators=(",", ":"))
+        _sheet_append(
+            self.spreadsheet_id,
+            self.tab_name,
+            [order.order_id, updated_at, mode, payload],
+        )
+        self.records[order.order_id.upper()] = LineOrderRecord(
+            order=order, updated_at=updated_at, mode=mode
+        )
+
+    def all_orders(self):
+        return [rec.order for rec in self.records.values()]
+
+
+def _init_google_sheet_persistence():
+    global order_event_store, line_order_store
+    if not BOT_RECORD_SHEET_ID:
+        raise RuntimeError("尚未設定 BOT_RECORD_SHEET_ID")
+    order_event_store = GoogleSheetEventStore(BOT_RECORD_SHEET_ID, BOT_EVENT_TAB)
+    line_order_store = GoogleSheetLineOrderStore(BOT_RECORD_SHEET_ID, BOT_LINE_ORDER_TAB)
+    app.logger.info(
+        "V1.6.9 Bot永久紀錄已啟用：sheet=%s event_tab=%s line_tab=%s events=%s line_orders=%s",
+        BOT_RECORD_SHEET_ID, BOT_EVENT_TAB, BOT_LINE_ORDER_TAB,
+        len(order_event_store.events), len(line_order_store.records),
+    )
 
 
 def _resolve_order_sheet_date(date_text):
@@ -1348,6 +1549,10 @@ def check_account(text):
 # =====================================================
 # 健康檢查（Render / 瀏覽器測試用）
 # =====================================================
+
+# V1.6.9：在開始接收 LINE webhook 前，先從永久 Google Sheet 載入歷史狀態。
+_init_google_sheet_persistence()
+
 
 @app.route("/", methods=["GET"])
 def health_check():
