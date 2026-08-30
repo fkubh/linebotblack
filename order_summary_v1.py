@@ -13,7 +13,7 @@ time, passenger count and current dispatch state.
 
 from __future__ import annotations
 
-PARSER_VERSION = "V1.6.2-20260831-summary-permission"
+PARSER_VERSION = "V1.6.4-20260831-group-usage-log"
 
 import argparse
 import html

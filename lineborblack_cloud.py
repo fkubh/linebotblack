@@ -97,14 +97,17 @@ ORDER_SHEET_MAX_COL = os.environ.get("ORDER_SHEET_MAX_COL", "H")
 ORDER_SHEET_TAB_TEMPLATE = os.environ.get("ORDER_SHEET_TAB_TEMPLATE", "{year}/{month}月")
 ORDER_SHOW_UNASSIGNED = os.environ.get("ORDER_SHOW_UNASSIGNED", "false").lower() in {"1", "true", "yes", "on"}
 
-# 簡表機密權限
-SUMMARY_ALLOWED_USER_IDS_RAW = os.environ.get("SUMMARY_ALLOWED_USER_IDS", "")
-SUMMARY_ALLOWED_USER_IDS = {
-    item.strip()
-    for item in re.split(r"[,\s;]+", SUMMARY_ALLOWED_USER_IDS_RAW)
-    if item.strip()
-}
+# V1.6.3 簡表密碼與管理員權限
+# 使用方式：簡表 9/2 9353、未派 9/2 9353
+SUMMARY_ACCESS_CODE = os.environ.get("SUMMARY_ACCESS_CODE", "9353").strip()
 SUMMARY_PRIVATE_ONLY = os.environ.get("SUMMARY_PRIVATE_ONLY", "true").lower() in {"1", "true", "yes", "on"}
+
+# 只有這個 LINE User ID 可以查詢「誰曾經私訊過 Bot」。
+# 請先私訊 Bot 輸入「我的ID」，再把取得的 U... 填到 Render：
+# SUMMARY_ADMIN_USER_ID=Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+SUMMARY_ADMIN_USER_ID = os.environ.get("SUMMARY_ADMIN_USER_ID", "").strip()
+BOT_INTERACTIONS_PATH = os.environ.get("BOT_INTERACTIONS_PATH", "bot_interactions_v1.json")
+BOT_USAGE_PATH = os.environ.get("BOT_USAGE_PATH", "bot_usage_v1.json")
 order_event_store = EventStore(ORDER_EVENTS_PATH)
 line_order_store = LineOrderStore(ORDER_LINE_ORDERS_PATH)
 
@@ -135,13 +138,18 @@ def _is_private_line_chat(event):
     return _line_source_type(event) == "user"
 
 
-def _summary_access_allowed(event):
-    user_id = _line_user_id(event)
-    if SUMMARY_PRIVATE_ONLY and not _is_private_line_chat(event):
-        return False, "private_only"
-    if not user_id or user_id not in SUMMARY_ALLOWED_USER_IDS:
-        return False, "not_allowed"
-    return True, "ok"
+def _summary_password_ok(text: str) -> bool:
+    if not SUMMARY_ACCESS_CODE:
+        return False
+    parts = (text or "").strip().split()
+    return bool(parts) and parts[-1] == SUMMARY_ACCESS_CODE
+
+
+def _strip_summary_password(text: str) -> str:
+    parts = (text or "").strip().split()
+    if parts and parts[-1] == SUMMARY_ACCESS_CODE:
+        return " ".join(parts[:-1]).strip()
+    return (text or "").strip()
 
 
 def _my_line_identity_text(event):
@@ -169,7 +177,193 @@ def _my_line_identity_text(event):
     lines.append(f"User ID：{user_id}")
     lines.append(f"目前來源：{source_text}")
     lines.append("")
-    lines.append("簡表權限：✅ 已授權" if user_id in SUMMARY_ALLOWED_USER_IDS else "簡表權限：❌ 尚未授權")
+    if SUMMARY_ADMIN_USER_ID and user_id == SUMMARY_ADMIN_USER_ID:
+        lines.append("管理員權限：✅")
+    else:
+        lines.append("管理員權限：❌")
+    return "\n".join(lines)
+
+
+def _load_interactions():
+    try:
+        with open(BOT_INTERACTIONS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_interactions(data):
+    try:
+        tmp = BOT_INTERACTIONS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, BOT_INTERACTIONS_PATH)
+    except Exception as exc:
+        app.logger.warning("互動紀錄儲存失敗：%s", exc)
+
+
+def _display_name_for_event(event):
+    user_id = _line_user_id(event)
+    if not user_id:
+        return ""
+
+    source = getattr(event, "source", None)
+    source_type = _line_source_type(event)
+
+    try:
+        if source_type == "group":
+            group_id = getattr(source, "group_id", "") or ""
+            if group_id and hasattr(line_bot_api, "get_group_member_profile"):
+                profile = line_bot_api.get_group_member_profile(group_id, user_id)
+                return getattr(profile, "display_name", "") or ""
+        if source_type == "room":
+            room_id = getattr(source, "room_id", "") or ""
+            if room_id and hasattr(line_bot_api, "get_room_member_profile"):
+                profile = line_bot_api.get_room_member_profile(room_id, user_id)
+                return getattr(profile, "display_name", "") or ""
+
+        profile = line_bot_api.get_profile(user_id)
+        return getattr(profile, "display_name", "") or ""
+    except Exception:
+        return ""
+
+
+def _load_usage():
+    try:
+        with open(BOT_USAGE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_usage(data):
+    try:
+        data = list(data)[-500:]
+        tmp = BOT_USAGE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, BOT_USAGE_PATH)
+    except Exception as exc:
+        app.logger.warning("Bot 使用紀錄儲存失敗：%s", exc)
+
+
+def _record_bot_usage(event, action, result="成功"):
+    """只記誰、何時、在哪裡觸發了哪個 Bot 功能；不保存原始訊息內容或密碼。"""
+    user_id = _line_user_id(event)
+    if not user_id:
+        return
+
+    source = getattr(event, "source", None)
+    source_type = _line_source_type(event)
+
+    item = {
+        "at": _taipei_now_iso(),
+        "user_id": user_id,
+        "display_name": _display_name_for_event(event),
+        "source": source_type or "unknown",
+        "action": action,
+        "result": result,
+    }
+
+    if source_type == "group":
+        item["source_id"] = getattr(source, "group_id", "") or ""
+    elif source_type == "room":
+        item["source_id"] = getattr(source, "room_id", "") or ""
+
+    data = _load_usage()
+    data.append(item)
+    _save_usage(data)
+
+
+def _usage_report(event):
+    user_id = _line_user_id(event)
+
+    if not SUMMARY_ADMIN_USER_ID or user_id != SUMMARY_ADMIN_USER_ID:
+        return "無權限使用此功能。"
+
+    if not _is_private_line_chat(event):
+        return "使用紀錄屬機密資料，請私訊 Bot 查詢。"
+
+    data = _load_usage()
+    if not data:
+        return "目前還沒有 Bot 使用紀錄。"
+
+    lines = [f"Bot 使用紀錄（最近 {min(len(data), 50)} 筆）："]
+
+    for item in reversed(data[-50:]):
+        source = item.get("source") or "unknown"
+        source_text = {
+            "user": "私訊",
+            "group": "群組",
+            "room": "聊天室",
+        }.get(source, source)
+
+        name = item.get("display_name") or "未取得名稱"
+        uid = item.get("user_id") or ""
+        at = item.get("at") or ""
+        action = item.get("action") or "未知功能"
+        result = item.get("result") or ""
+
+        lines.append("")
+        lines.append(f"{at}｜{source_text}")
+        lines.append(f"{name}｜{uid}")
+        lines.append(f"觸發：{action}｜{result}")
+
+    return "\n".join(lines)
+
+
+def _record_private_interaction(event):
+    """只記錄誰私訊過 Bot，不保存使用者訊息內容。"""
+    if not _is_private_line_chat(event):
+        return
+    user_id = _line_user_id(event)
+    if not user_id:
+        return
+
+    display_name = _display_name_for_event(event)
+
+    data = _load_interactions()
+    item = data.get(user_id, {})
+    item["user_id"] = user_id
+    if display_name:
+        item["display_name"] = display_name
+    item["last_seen"] = _taipei_now_iso()
+    item["count"] = int(item.get("count", 0) or 0) + 1
+    data[user_id] = item
+    _save_interactions(data)
+
+
+def _interaction_report(event):
+    user_id = _line_user_id(event)
+    if not SUMMARY_ADMIN_USER_ID or user_id != SUMMARY_ADMIN_USER_ID:
+        return "無權限使用此功能。"
+
+    data = _load_interactions()
+    if not data:
+        return "目前還沒有私訊紀錄。"
+
+    items = sorted(
+        data.values(),
+        key=lambda x: x.get("last_seen", ""),
+        reverse=True
+    )
+
+    lines = [f"私訊 Bot 的使用者（共 {len(items)} 人）："]
+    for item in items[:50]:
+        name = item.get("display_name") or "未取得名稱"
+        uid = item.get("user_id") or ""
+        last_seen = item.get("last_seen") or ""
+        count = item.get("count", 0)
+        lines.append("")
+        lines.append(name)
+        lines.append(f"User ID：{uid}")
+        lines.append(f"最後私訊：{last_seen}")
+        lines.append(f"互動次數：{count}")
+    if len(items) > 50:
+        lines.append("")
+        lines.append(f"另有 {len(items) - 50} 人未顯示。")
     return "\n".join(lines)
 
 def _taipei_now_iso():
@@ -462,6 +656,13 @@ def capture_line_activity(event, text):
                     plate=plate,
                     note="由完整訂單下方司機資料自動辨識",
                 ))
+        try:
+            _record_bot_usage(
+                event,
+                "LINE完整訂單/派車資料" if (driver_name or plate) else "LINE完整訂單"
+            )
+        except Exception:
+            pass
         return False
 
     if alias_event and oid:
@@ -471,35 +672,60 @@ def capture_line_activity(event, text):
             at=now,
             note=text[:500],
         ))
+        try:
+            alias_label = {
+                "cancelled": "訂單取消",
+                "recalled": "拉回/改派",
+                "driver_change": "改司機",
+                "edited": "訂單修正",
+            }.get(alias_event, "訂單異動")
+            _record_bot_usage(event, alias_label)
+        except Exception:
+            pass
         return True
 
     return False
 
 def handle_order_v1_command(event, text):
-    cmd = parse_line_command(text)
+    raw_text = text
+    command_text = _strip_summary_password(raw_text)
+    cmd = parse_line_command(command_text)
     if not cmd:
         return False
 
-    # V1.6.2：完整簡表與未派簡表都屬機密資料。
+    # V1.6.3：簡表改為密碼制，且預設只能私訊 Bot 查詢。
     if cmd["command"] in {"summary", "summary_unassigned"}:
-        allowed, reason = _summary_access_allowed(event)
-        if not allowed:
-            if reason == "private_only":
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text="簡表屬機密資料，請私訊 Bot 查詢。")
-                )
-            else:
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(
-                        text="無權限使用簡表功能。\n請先私訊 Bot 輸入「我的ID」取得你的 LINE User ID。"
-                    )
-                )
+        action_name = "未派簡表查詢" if cmd["command"] == "summary_unassigned" else "完整簡表查詢"
+
+        if SUMMARY_PRIVATE_ONLY and not _is_private_line_chat(event):
+            try:
+                _record_bot_usage(event, action_name, "群組阻擋")
+            except Exception:
+                pass
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="簡表屬機密資料，請私訊 Bot 查詢。")
+            )
+            return True
+
+        if not _summary_password_ok(raw_text):
+            try:
+                _record_bot_usage(event, action_name, "密碼錯誤")
+            except Exception:
+                pass
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="簡表密碼錯誤。")
+            )
             return True
 
     try:
         if cmd["command"] in {"summary", "summary_unassigned"}:
+            _record_bot_usage(
+                event,
+                "未派簡表查詢" if cmd["command"] == "summary_unassigned" else "完整簡表查詢",
+                "成功",
+            )
             orders = load_orders_for_date(cmd["date"])
             if cmd["command"] == "summary_unassigned":
                 summary = generate_unassigned_summary(
@@ -528,11 +754,13 @@ def handle_order_v1_command(event, text):
             return True
 
         if cmd["command"] == "history":
+            _record_bot_usage(event, "訂單歷史查詢")
             text_out = order_history_by_id(cmd["order_id"])
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text_out[:5000]))
             return True
 
         if cmd["command"] == "event":
+            _record_bot_usage(event, "訂單調度/異動指令")
             event_obj = Event(
                 order_id=cmd["order_id"],
                 event_type=cmd["event_type"],
@@ -777,6 +1005,11 @@ def normalize_account(value):
 
 def reply_blacklist(event, item, match_type):
 
+    try:
+        _record_bot_usage(event, f"黑名單查詢（{match_type}）")
+    except Exception:
+        pass
+
     name = item.get("name", "未提供")
     phone = display_phone(item.get("phone", []))
     plate = item.get("plate", "")
@@ -835,6 +1068,11 @@ def reply_blacklist(event, item, match_type):
 # =====================================================
 
 def reply_special_note(event, item, match_type):
+
+    try:
+        _record_bot_usage(event, f"特殊註記查詢（{match_type}）")
+    except Exception:
+        pass
 
     name = item.get("name", "未提供")
     phone = display_phone(item.get("phone", []))
@@ -1155,15 +1393,46 @@ def handle_message(event):
 
     text = event.message.text.strip()
 
-    # V1.6.2：查看自己的 LINE User ID / 簡表授權狀態。
+    # 記錄「誰曾經私訊過 Bot」；不保存訊息內容。
+    try:
+        _record_private_interaction(event)
+    except Exception as exc:
+        app.logger.warning("互動紀錄失敗：%s", exc)
+
+    # 查看自己的 LINE User ID / 管理員狀態。
     if text in {"我的ID", "我的id", "我的 Id", "我的權限", "權限"}:
+        try:
+            _record_bot_usage(event, "我的ID/權限查詢")
+        except Exception:
+            pass
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text=_my_line_identity_text(event))
         )
         return
 
-    # Render log 只記錄互動者 User ID 與來源，不保存訊息內容。
+    # 只有管理員本人可以查看「誰私訊過 Bot」，且只在私訊中回傳。
+    if text in {"誰私訊過機器人", "誰私訊過Bot", "私訊紀錄", "訊息紀錄"}:
+        if not _is_private_line_chat(event):
+            reply_text = (
+                "私訊紀錄屬機密資料，請私訊 Bot 查詢。"
+                if _line_user_id(event) == SUMMARY_ADMIN_USER_ID
+                else "無權限使用此功能。"
+            )
+        else:
+            reply_text = _interaction_report(event)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        return
+
+    # V1.6.4：私訊＋群組，只記錄真正觸發 Bot 功能的人。
+    # 只有管理員本人，而且必須私訊 Bot 才能查看。
+    if text in {"使用紀錄", "觸發紀錄", "誰使用過機器人", "誰觸發過機器人", "Bot使用紀錄"}:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=_usage_report(event))
+        )
+        return
+
     try:
         app.logger.info(
             "LINE互動 user_id=%s source=%s",
@@ -1175,6 +1444,10 @@ def handle_message(event):
 
     # 訂單解析器版本檢查：可在 LINE 輸入「版本」確認 Render 目前實際載入哪一版。
     if text in {"版本", "訂單版本", "parser version"}:
+        try:
+            _record_bot_usage(event, "版本查詢")
+        except Exception:
+            pass
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text=f"訂單解析器：{PARSER_VERSION}")
