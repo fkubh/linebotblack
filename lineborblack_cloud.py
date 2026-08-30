@@ -108,8 +108,8 @@ BOT_LINE_ORDER_TAB = os.environ.get("BOT_LINE_ORDER_TAB", "LINE訂單").strip() 
 
 # V1.6.10：只有包車群＋測試群可寫入 LINE 訂單／調度狀態。
 # 先部署後在兩群輸入「群組ID」取得 ID，再填入 Render 環境變數。
-PACKAGE_GROUP_ID = os.environ.get("PACKAGE_GROUP_ID", "").strip()
-TEST_GROUP_ID = os.environ.get("TEST_GROUP_ID", "").strip()
+PACKAGE_GROUP_ID = os.environ.get("PACKAGE_GROUP_ID", "Cbec1868a3b62f4210cb9ade284cd8409").strip()
+TEST_GROUP_ID = os.environ.get("TEST_GROUP_ID", "C89a73c61413eaa4d761ae9e2e11cf96f").strip()
 BOT_RECORD_RETENTION_DAYS = int(os.environ.get("BOT_RECORD_RETENTION_DAYS", "60"))
 _cleanup_state = {"last_run": None}
 
