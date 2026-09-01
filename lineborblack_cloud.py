@@ -629,6 +629,12 @@ class GoogleSheetLineOrderStore:
             try:
                 payload = json.loads(row[3])
                 order = Order(**payload)
+                # V1.6.15: repair older persisted LINE records whose pickup time was
+                # left blank because the time lived in 出發日期 instead of 航班編號.
+                if not str(getattr(order, "time", "") or "").strip() and getattr(order, "raw_text", ""):
+                    repaired = parse_line_order_text(order.raw_text)
+                    if repaired and repaired.time:
+                        order.time = repaired.time
                 rec = LineOrderRecord(
                     order=order,
                     updated_at=str(row[1]).strip(),

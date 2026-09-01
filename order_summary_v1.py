@@ -13,7 +13,7 @@ time, passenger count and current dispatch state.
 
 from __future__ import annotations
 
-PARSER_VERSION = "V1.6.13-20260902-driver-label-spacing"
+PARSER_VERSION = "V1.6.15-20260902-time-priority"
 
 import argparse
 import html
@@ -450,21 +450,45 @@ def detect_trip_type(raw: str, fields: dict[str, str]) -> str:
 
 
 def detect_time(trip_type: str, fields: dict[str, str]) -> str:
+    """Choose the operational time using dispatch priority.
+
+    送機：出發日期旁的時間優先。
+    接機：指定時間 > 航班時間 > 出發日期旁的時間。
+
+    「指定時間」可能寫成「指定時間 00:10」或「9/3 00:10 指定時間」，
+    所以只要同一欄位含「指定時間」，就取該欄位中的時間。
+    """
     dep = fields.get("出發日期", "")
     flight = fields.get("航班編號", "")
-    # Explicit designated pickup time wins for airport pickup.
+
+    # 送機：日期旁時間就是派車/出發時間，永遠優先。
+    if trip_type == "送機":
+        return time_hhmm(dep)
+
     if trip_type == "接機":
-        m = re.search(r"指定時間\s*([0-2]?\d\s*[:：]\s*[0-5]\d)", dep)
-        if m:
-            return time_hhmm(m.group(1))
-        # Prefer 【HH:MM】, then （HH:MM）/(HH:MM), then any time in flight text.
+        # 1) 指定時間優先。通常會寫在出發日期旁，也兼容備註等其他欄位。
+        #    支援「指定時間 00:10」與「9/3 00:10 指定時間」兩種順序。
+        for value in fields.values():
+            text = value or ""
+            if "指定時間" in text:
+                t = time_hhmm(text)
+                if t:
+                    return t
+
+        # 2) 再抓航班時間：優先括號內，再抓航班欄位內任何 HH:MM。
         for pattern in [r"【\s*([^】]+)\s*】", r"[（(]\s*([^）)]+)\s*[）)]"]:
             m = re.search(pattern, flight)
             if m:
                 t = time_hhmm(m.group(1))
                 if t:
                     return t
-        return time_hhmm(flight)
+        flight_time = time_hhmm(flight)
+        if flight_time:
+            return flight_time
+
+        # 3) 航班欄沒有時間時，最後才使用出發日期旁的時間。
+        return time_hhmm(dep)
+
     return time_hhmm(dep)
 
 
