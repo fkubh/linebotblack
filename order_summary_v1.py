@@ -13,7 +13,7 @@ time, passenger count and current dispatch state.
 
 from __future__ import annotations
 
-PARSER_VERSION = "V1.6.11-20260831-live-sheet-refresh"
+PARSER_VERSION = "V1.6.12-20260901-driver-format-expansion"
 
 import argparse
 import html
@@ -250,22 +250,35 @@ def merge_sheet_and_line_orders(sheet_orders: list[Order], line_store: Optional[
 
 
 DRIVER_NAME_PATTERNS = (
-    r"(?:服務駕駛|司機姓名|駕駛姓名|司機|駕駛)\s*[：:；;]\s*([^\n\r，,]{2,20})",
+    # 實際群組常見格式：司機 王錫云 / 司機名字：蔡秉夆 / 駕駛：XXX
+    # 冒號不是必填，避免只因人工輸入習慣不同就漏判。
+    r"(?:服務駕駛|司機姓名|司機名字|駕駛姓名|司機(?!資料)|駕駛(?!資料))\s*[：:；;]?\s*([^\n\r，,（(]{2,20})",
 )
 PLATE_PATTERNS = (
-    r"(?:車號|車牌|車牌號碼)\s*[：:；;]\s*([A-Z0-9]{2,5}-?[A-Z0-9]{2,5})",
+    # 車號／車牌／牌照／車輛號碼皆視為車牌欄位；允許 RF R-7330 這種中間空格。
+    r"(?:車輛號碼|車牌號碼|車號|車牌|牌照)\s*[：:；;]?\s*([A-Z0-9][A-Z0-9 \-]{3,14})",
 )
+
+
+def _normalize_plate(value: str) -> str:
+    compact = re.sub(r"\s+", "", (value or "").upper())
+    compact = re.sub(r"[^A-Z0-9-]", "", compact)
+    # 防止正則把下一個欄位前的殘字吃進來；台灣營業車常見 ABC-1234。
+    m = re.search(r"[A-Z0-9]{2,4}-[A-Z0-9]{3,4}", compact)
+    return m.group(0) if m else compact
 
 
 def extract_driver_info(text: str) -> tuple[str, str]:
-    """Extract driver name/plate from the two real dispatch formats.
+    """Extract driver name/plate from real dispatch messages.
 
-    Supported examples:
-      服務駕駛：陳宥佐 / 車號：RGD-5015
-      姓名：陳宗鑫 / 車牌：RFX-1227 / 車型：...
-    The generic 姓名 field is only accepted when it is close to a vehicle plate
-    and appears in the same trailing driver block, so passenger/contact names
-    earlier in the order are not mistaken for drivers.
+    Accepts common human-entered variants, with or without colon, including:
+      司機 蔡東雄 / 車號 REB-1662
+      姓名：戴恩慈 / 車牌：RAM-5871
+      司機名字：蔡秉夆 / 車輛號碼：RFR-7785
+      姓名：張奇 / 車號：RF R-7330
+      駕駛資料：姓名：凱中 / 牌照：RFT-1993
+    Generic 「姓名」 is accepted only when a plate field exists nearby, so the
+    passenger/contact name earlier in the order is not treated as the driver.
     """
     raw = html.unescape(text or "").replace("\r\n", "\n").replace("\r", "\n")
     name = ""
@@ -275,7 +288,7 @@ def extract_driver_info(text: str) -> tuple[str, str]:
     for p in DRIVER_NAME_PATTERNS:
         m = re.search(p, raw, re.I)
         if m:
-            name = normalize_spaces(m.group(1))
+            name = normalize_spaces(m.group(1)).strip(" ：:；;")
             break
 
     # Plate/vehicle number is a strong signal that a driver block exists.
@@ -284,19 +297,18 @@ def extract_driver_info(text: str) -> tuple[str, str]:
         m = re.search(p, raw, re.I)
         if m:
             plate_match = m
-            plate = m.group(1).upper().replace(" ", "")
+            plate = _normalize_plate(m.group(1))
             break
 
-    # Some dispatches use only 「姓名」 instead of 「司機/服務駕駛」.
-    # Only trust that 姓名 when it is in the few lines immediately before 車牌/車號.
+    # Some dispatches use only 「姓名」. Trust it only close to the plate field.
     if not name and plate_match:
         before = raw[:plate_match.start()]
         lines = [line.strip() for line in before.split("\n") if line.strip()]
-        nearby = lines[-5:]
+        nearby = lines[-6:]
         for line in reversed(nearby):
-            m = re.match(r"^姓名\s*[：:；;]\s*(.+?)\s*$", line)
+            m = re.match(r"^姓名\s*[：:；;]?\s*(.+?)\s*$", line)
             if m:
-                candidate = normalize_spaces(m.group(1))
+                candidate = normalize_spaces(m.group(1)).strip(" ：:；;")
                 if 1 < len(candidate) <= 20:
                     name = candidate
                 break
