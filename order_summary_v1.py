@@ -13,7 +13,7 @@ time, passenger count and current dispatch state.
 
 from __future__ import annotations
 
-PARSER_VERSION = "V1.6.12-20260901-driver-format-expansion"
+PARSER_VERSION = "V1.6.13-20260902-driver-label-spacing"
 
 import argparse
 import html
@@ -250,13 +250,13 @@ def merge_sheet_and_line_orders(sheet_orders: list[Order], line_store: Optional[
 
 
 DRIVER_NAME_PATTERNS = (
-    # 實際群組常見格式：司機 王錫云 / 司機名字：蔡秉夆 / 駕駛：XXX
-    # 冒號不是必填，避免只因人工輸入習慣不同就漏判。
-    r"(?:服務駕駛|司機姓名|司機名字|駕駛姓名|司機(?!資料)|駕駛(?!資料))\s*[：:；;]?\s*([^\n\r，,（(]{2,20})",
+    # 實際群組常見格式：司機 王錫云 / 司機名字：蔡秉夆 / 駕駛：XXX。
+    # V1.6.13：也接受中文字中間被人工插入空白，例如「駕  駛：何穎鈞」。
+    r"(?:服\s*務\s*駕\s*駛|司\s*機\s*姓\s*名|司\s*機\s*名\s*字|駕\s*駛\s*姓\s*名|司\s*機(?!\s*資\s*料)|駕\s*駛(?!\s*資\s*料))\s*[：:；;]?\s*([^\n\r，,（(]{2,20})",
 )
 PLATE_PATTERNS = (
-    # 車號／車牌／牌照／車輛號碼皆視為車牌欄位；允許 RF R-7330 這種中間空格。
-    r"(?:車輛號碼|車牌號碼|車號|車牌|牌照)\s*[：:；;]?\s*([A-Z0-9][A-Z0-9 \-]{3,14})",
+    # 車號／車牌／牌照／車輛號碼皆視為車牌欄位；允許 RF R-7330 及「車  號」等格式。
+    r"(?:車\s*輛\s*號\s*碼|車\s*牌\s*號\s*碼|車\s*號|車\s*牌|牌\s*照)\s*[：:；;]?\s*([A-Z0-9][A-Z0-9 \-]{3,14})",
 )
 
 
