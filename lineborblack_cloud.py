@@ -106,12 +106,19 @@ BOT_RECORD_SHEET_ID = os.environ.get(
 BOT_EVENT_TAB = os.environ.get("BOT_EVENT_TAB", "訂單事件").strip() or "訂單事件"
 BOT_LINE_ORDER_TAB = os.environ.get("BOT_LINE_ORDER_TAB", "LINE訂單").strip() or "LINE訂單"
 
+# V1.6.16：Webhook / Google Sheet 漏單追蹤。
+BOT_RAW_EVENT_TAB = os.environ.get("BOT_RAW_EVENT_TAB", "LINE原始事件").strip() or "LINE原始事件"
+BOT_RAW_EVENT_LOG_ENABLED = os.environ.get("BOT_RAW_EVENT_LOG_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+GOOGLE_SHEET_RETRY_ATTEMPTS = max(1, int(os.environ.get("GOOGLE_SHEET_RETRY_ATTEMPTS", "3")))
+GOOGLE_SHEET_RETRY_BASE_SECONDS = max(0.2, float(os.environ.get("GOOGLE_SHEET_RETRY_BASE_SECONDS", "1.0")))
+
 # V1.6.10：只有包車群＋測試群可寫入 LINE 訂單／調度狀態。
 # 先部署後在兩群輸入「群組ID」取得 ID，再填入 Render 環境變數。
 PACKAGE_GROUP_ID = os.environ.get("PACKAGE_GROUP_ID", "Cbec1868a3b62f4210cb9ade284cd8409").strip()
 TEST_GROUP_ID = os.environ.get("TEST_GROUP_ID", "C89a73c61413eaa4d761ae9e2e11cf96f").strip()
 BOT_RECORD_RETENTION_DAYS = int(os.environ.get("BOT_RECORD_RETENTION_DAYS", "60"))
 _cleanup_state = {"last_run": None}
+_processed_webhook_event_ids = set()
 
 # V1.6.3 簡表密碼與管理員權限
 # 使用方式：簡表 9/2 9353、未派 9/2 9353
@@ -159,6 +166,16 @@ def _line_group_id(event):
 
 def _authorized_order_group_ids():
     return {gid for gid in (PACKAGE_GROUP_ID, TEST_GROUP_ID) if gid}
+
+
+def _line_event_id(event):
+    """LINE webhook_event_id；舊版 SDK/測試事件沒有時回空字串。"""
+    return str(getattr(event, "webhook_event_id", "") or "").strip()
+
+
+def _line_is_redelivery(event):
+    ctx = getattr(event, "delivery_context", None)
+    return bool(getattr(ctx, "is_redelivery", False)) if ctx is not None else False
 
 
 def _is_authorized_order_source(event):
@@ -407,6 +424,39 @@ def _taipei_now_iso():
     return datetime.now(ZoneInfo("Asia/Taipei")).isoformat(timespec="minutes")
 
 
+def _google_request(method, url, *, operation="Google API", retry=True, **kwargs):
+    """Google API request with bounded retry for 429/5xx/network failures."""
+    attempts = GOOGLE_SHEET_RETRY_ATTEMPTS if retry else 1
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.request(method, url, **kwargs)
+            if response.status_code < 400:
+                return response
+            if response.status_code == 429 or response.status_code >= 500:
+                app.logger.warning(
+                    "[SHEET RETRY] op=%s attempt=%s/%s status=%s body=%s",
+                    operation, attempt, attempts, response.status_code, response.text[:300],
+                )
+                if attempt < attempts:
+                    time.sleep(GOOGLE_SHEET_RETRY_BASE_SECONDS * attempt)
+                    continue
+            response.raise_for_status()
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_exc = exc
+            app.logger.warning(
+                "[SHEET RETRY] op=%s attempt=%s/%s error=%r",
+                operation, attempt, attempts, exc,
+            )
+            if attempt < attempts:
+                time.sleep(GOOGLE_SHEET_RETRY_BASE_SECONDS * attempt)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"{operation} failed after {attempts} attempts")
+
+
 def _sheet_values(spreadsheet_id, range_name):
     if not GOOGLE_CREDENTIALS.valid:
         GOOGLE_CREDENTIALS.refresh(GoogleAuthRequest())
@@ -417,7 +467,7 @@ def _sheet_values(spreadsheet_id, range_name):
         f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
         f"{encoded_range}"
     )
-    response = requests.get(url, headers=headers, timeout=15)
+    response = _google_request("GET", url, headers=headers, timeout=15, operation=f"READ {range_name}")
     if response.status_code != 200:
         app.logger.error("訂單 Google Sheets API 錯誤 %s：%s", response.status_code, response.text)
     response.raise_for_status()
@@ -436,7 +486,7 @@ def _google_headers():
 
 def _sheet_metadata(spreadsheet_id):
     url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}?fields=sheets.properties"
-    response = requests.get(url, headers=_google_headers(), timeout=15)
+    response = _google_request("GET", url, headers=_google_headers(), timeout=15, operation="SHEET METADATA")
     response.raise_for_status()
     return response.json()
 
@@ -451,7 +501,7 @@ def _ensure_sheet_tab(spreadsheet_id, tab_name, headers):
     if tab_name not in titles:
         url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate"
         payload = {"requests": [{"addSheet": {"properties": {"title": tab_name}}}]}
-        response = requests.post(url, headers=_google_headers(), json=payload, timeout=15)
+        response = _google_request("POST", url, headers=_google_headers(), json=payload, timeout=15, operation=f"ADD TAB {tab_name}")
         response.raise_for_status()
 
     existing = _sheet_values(spreadsheet_id, f"'{tab_name}'!A1:Z1")
@@ -461,11 +511,11 @@ def _ensure_sheet_tab(spreadsheet_id, tab_name, headers):
             f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
             f"{encoded_range}?valueInputOption=RAW"
         )
-        response = requests.put(
-            url,
+        response = _google_request(
+            "PUT", url,
             headers=_google_headers(),
             json={"range": f"'{tab_name}'!A1", "majorDimension": "ROWS", "values": [headers]},
-            timeout=15,
+            timeout=15, operation=f"WRITE HEADER {tab_name}",
         )
         response.raise_for_status()
 
@@ -476,11 +526,11 @@ def _sheet_append(spreadsheet_id, tab_name, values):
         f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
         f"{encoded_range}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS"
     )
-    response = requests.post(
-        url,
+    response = _google_request(
+        "POST", url,
         headers=_google_headers(),
         json={"majorDimension": "ROWS", "values": [values]},
-        timeout=15,
+        timeout=15, operation=f"APPEND {tab_name}",
     )
     if response.status_code >= 300:
         app.logger.error("Bot紀錄 Google Sheets 寫入失敗 %s：%s", response.status_code, response.text)
@@ -493,7 +543,7 @@ def _sheet_clear(spreadsheet_id, range_name):
         f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
         f"{encoded_range}:clear"
     )
-    response = requests.post(url, headers=_google_headers(), json={}, timeout=15)
+    response = _google_request("POST", url, headers=_google_headers(), json={}, timeout=15, operation=f"CLEAR {range_name}")
     response.raise_for_status()
 
 
@@ -505,9 +555,9 @@ def _sheet_write_rows(spreadsheet_id, start_range, rows):
         f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
         f"{encoded_range}?valueInputOption=RAW"
     )
-    response = requests.put(
-        url, headers=_google_headers(),
-        json={"majorDimension": "ROWS", "values": rows}, timeout=15,
+    response = _google_request(
+        "PUT", url, headers=_google_headers(),
+        json={"majorDimension": "ROWS", "values": rows}, timeout=15, operation=f"WRITE {start_range}",
     )
     response.raise_for_status()
 
@@ -525,6 +575,52 @@ def _parse_record_time(value):
         except ValueError:
             pass
     return None
+
+
+RAW_EVENT_HEADERS = [
+    "received_at", "event_id", "is_redelivery", "source_type", "group_id",
+    "user_id", "message_type", "text", "status", "detail",
+]
+
+
+def _raw_event_log(event, text, status, detail=""):
+    """Append-only audit trail. Failure is logged but never masks the main handler error."""
+    if not BOT_RAW_EVENT_LOG_ENABLED or not BOT_RECORD_SHEET_ID:
+        return
+    try:
+        _sheet_append(
+            BOT_RECORD_SHEET_ID,
+            BOT_RAW_EVENT_TAB,
+            [
+                _taipei_now_iso(), _line_event_id(event), str(_line_is_redelivery(event)),
+                _line_source_type(event), _line_group_id(event), _line_user_id(event),
+                "text", str(text or "")[:4000], status, str(detail or "")[:1000],
+            ],
+        )
+    except Exception as exc:
+        app.logger.exception("[RAW LOG ERROR] event=%s status=%s error=%r", _line_event_id(event), status, exc)
+
+
+def _load_processed_webhook_event_ids():
+    """Load successfully processed LINE webhook IDs so redelivery is idempotent across Render restarts."""
+    global _processed_webhook_event_ids
+    if not BOT_RAW_EVENT_LOG_ENABLED or not BOT_RECORD_SHEET_ID:
+        _processed_webhook_event_ids = set()
+        return
+    try:
+        rows = _sheet_values(BOT_RECORD_SHEET_ID, f"'{BOT_RAW_EVENT_TAB}'!A2:J")
+        done = set()
+        for row in rows:
+            row = list(row) + [""] * (10 - len(row))
+            event_id = str(row[1] or "").strip()
+            status = str(row[8] or "").strip().upper()
+            if event_id and status == "PROCESSED":
+                done.add(event_id)
+        _processed_webhook_event_ids = done
+        app.logger.info("[WEBHOOK DEDUPE] loaded_processed_event_ids=%s", len(done))
+    except Exception as exc:
+        app.logger.exception("[WEBHOOK DEDUPE ERROR] load failed: %r", exc)
+        _processed_webhook_event_ids = set()
 
 
 class GoogleSheetEventStore:
@@ -566,6 +662,7 @@ class GoogleSheetEventStore:
         self.events = events
 
     def add(self, event):
+        app.logger.info("[EVENT WRITE] order_id=%s type=%s at=%s", event.order_id, event.event_type, event.at)
         _sheet_append(
             self.spreadsheet_id,
             self.tab_name,
@@ -576,6 +673,7 @@ class GoogleSheetEventStore:
             ],
         )
         self.events.append(event)
+        app.logger.info("[EVENT OK] order_id=%s type=%s", event.order_id, event.event_type)
 
     def cleanup_older_than(self, cutoff):
         kept = []
@@ -651,6 +749,7 @@ class GoogleSheetLineOrderStore:
 
     def upsert(self, order, updated_at, mode="line_added"):
         from dataclasses import asdict
+        app.logger.info("[ORDER WRITE] order_id=%s mode=%s at=%s", order.order_id, mode, updated_at)
         from order_summary_v1 import LineOrderRecord
         payload = json.dumps(asdict(order), ensure_ascii=False, separators=(",", ":"))
         _sheet_append(
@@ -661,6 +760,7 @@ class GoogleSheetLineOrderStore:
         self.records[order.order_id.upper()] = LineOrderRecord(
             order=order, updated_at=updated_at, mode=mode
         )
+        app.logger.info("[ORDER OK] order_id=%s mode=%s", order.order_id, mode)
 
     def cleanup_older_than(self, cutoff):
         rows = _sheet_values(self.spreadsheet_id, f"'{self.tab_name}'!A2:D")
@@ -703,6 +803,9 @@ def _init_google_sheet_persistence():
         raise RuntimeError("尚未設定 BOT_RECORD_SHEET_ID")
     order_event_store = GoogleSheetEventStore(BOT_RECORD_SHEET_ID, BOT_EVENT_TAB)
     line_order_store = GoogleSheetLineOrderStore(BOT_RECORD_SHEET_ID, BOT_LINE_ORDER_TAB)
+    if BOT_RAW_EVENT_LOG_ENABLED:
+        _ensure_sheet_tab(BOT_RECORD_SHEET_ID, BOT_RAW_EVENT_TAB, RAW_EVENT_HEADERS)
+        _load_processed_webhook_event_ids()
     app.logger.info(
         "V1.6.10 Bot永久紀錄已啟用：sheet=%s event_tab=%s line_tab=%s events=%s line_orders=%s",
         BOT_RECORD_SHEET_ID, BOT_EVENT_TAB, BOT_LINE_ORDER_TAB,
@@ -896,6 +999,10 @@ def capture_line_activity(event, text):
     detected_driver_name, detected_plate = extract_driver_info(text)
 
     if full_order:
+        app.logger.info(
+            "[ORDER PARSED] event=%s redelivery=%s order_id=%s date=%s time=%s",
+            _line_event_id(event), _line_is_redelivery(event), full_order.order_id, full_order.date, full_order.time,
+        )
         existing_line = line_order_store.get(full_order.order_id)
         try:
             sheet_orders = _sheet_orders_only_for_date(full_order.date)
@@ -1725,12 +1832,10 @@ def callback():
         as_text=True
     )
 
-    app.logger.info(
-        "Request body: " + body
-    )
+    app.logger.info("[WEBHOOK RX] bytes=%s", len(body.encode("utf-8")))
 
-
-    # LINE 驗證
+    # LINE 驗證 / 同步處理：只有全部 handler 完成才回 200。
+    # 若 Google Sheet 寫入失敗，讓 request 回 500，避免錯誤被吃掉後仍回 200。
     try:
 
         handler.handle(
@@ -1748,7 +1853,11 @@ def callback():
 
         abort(400)
 
+    except Exception as exc:
+        app.logger.exception("[WEBHOOK ERROR] handler failed: %r", exc)
+        return "ERROR", 500
 
+    app.logger.info("[WEBHOOK OK]")
     return "OK"
 
 
@@ -1763,6 +1872,18 @@ def callback():
 def handle_message(event):
 
     text = event.message.text.strip()
+    event_id = _line_event_id(event)
+    app.logger.info(
+        "[LINE RX] event=%s redelivery=%s source=%s group=%s user=%s text=%r",
+        event_id or "(none)", _line_is_redelivery(event), _line_source_type(event),
+        _line_group_id(event) or "-", _line_user_id(event) or "-", text[:500],
+    )
+    if event_id and event_id in _processed_webhook_event_ids:
+        app.logger.info("[LINE DUPLICATE] event=%s redelivery=%s skipped=true", event_id, _line_is_redelivery(event))
+        return
+
+    if _is_authorized_order_source(event):
+        _raw_event_log(event, text, "RECEIVED")
 
     # 記錄「誰曾經私訊過 Bot」；不保存訊息內容。
     try:
@@ -1835,12 +1956,25 @@ def handle_message(event):
         )
         return
 
-    # V1.6：先被動記錄 LINE 完整訂單／取消／拉回／改司機／訂單修正。
+    # V1.6.16：先被動記錄 LINE 完整訂單／取消／拉回／改司機／訂單修正。
+    # 這裡不可吞掉例外：寫 Sheet 失敗必須讓 /callback 回 500，交由 LINE redelivery。
     try:
-        if capture_line_activity(event, text):
+        captured_only = capture_line_activity(event, text)
+        if _is_authorized_order_source(event):
+            parsed = parse_line_order_text(text)
+            _raw_event_log(
+                event, text, "PROCESSED",
+                f"order_id={getattr(parsed, 'order_id', '')}" if parsed else "non_full_order",
+            )
+        if event_id:
+            _processed_webhook_event_ids.add(event_id)
+        if captured_only:
             return
     except Exception as exc:
-        app.logger.exception("LINE 訂單自動記錄失敗：%s", exc)
+        if _is_authorized_order_source(event):
+            _raw_event_log(event, text, "ERROR", repr(exc))
+        app.logger.exception("[ORDER SAVE FAILED] event=%s error=%r", event_id or "(none)", exc)
+        raise
 
     # 每則訊息處理前確認 Google Sheet 快取；預設每 30 秒更新一次。
     try:

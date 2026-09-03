@@ -13,7 +13,7 @@ time, passenger count and current dispatch state.
 
 from __future__ import annotations
 
-PARSER_VERSION = "V1.6.15-20260902-time-priority"
+PARSER_VERSION = "V1.6.16-20260903-webhook-reliability"
 
 import argparse
 import html
