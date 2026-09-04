@@ -13,10 +13,11 @@ time, passenger count and current dispatch state.
 
 from __future__ import annotations
 
-PARSER_VERSION = "V1.6.16-20260903-webhook-reliability"
+PARSER_VERSION = "V1.6.17-20260904-line-summary-time-fix"
 
 import argparse
 import html
+import hashlib
 import json
 import re
 import zipfile
@@ -34,7 +35,7 @@ FIELD_LABELS = [
 FIELD_RE = re.compile(r"^\s*(%s)\s*[：:]\s*(.*)$" % "|".join(map(re.escape, FIELD_LABELS)))
 ORDER_ID_RE = re.compile(r"\b(?:\d{2}KK\d{9}|ORD\d{10}|[A-Z]{3}\d{6}|[A-Z]{2}\d{2}[A-Z]\d{4})\b", re.I)
 DATE_RE = re.compile(r"(?<!\d)(\d{1,2})\s*/\s*(\d{1,2})(?!\d)")
-TIME_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3])\s*[:：]\s*([0-5]\d)(?!\d)")
+TIME_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3])\s*[:：;；]\s*([0-5]\d)(?!\d)")
 
 # Normal districts. For ambiguous compass districts we keep the city prefix when available.
 CITY_PREFIX_RE = re.compile(r"(台北市|臺北市|新北市|桃園市|台中市|臺中市|台南市|臺南市|高雄市|基隆市|新竹市|嘉義市|新竹縣|苗栗縣|彰化縣|南投縣|雲林縣|嘉義縣|屏東縣|宜蘭縣|花蓮縣|台東縣|臺東縣|澎湖縣)([\u4e00-\u9fff]{1,5}?(?:區|鎮|鄉|市))")
@@ -186,13 +187,27 @@ class LineOrderStore:
         return [rec.order for rec in self.records.values()]
 
 
+def _synthetic_line_order_id(raw: str) -> str:
+    """Stable ID for full LINE orders that do not contain a formal order number.
+
+    Driver assignment lines are removed before hashing so reposting the same order
+    with/without driver information keeps the same internal order id.
+    """
+    keep = []
+    for line in (raw or "").splitlines():
+        if re.match(r"^\s*(?:司\s*機|駕\s*駛|車\s*號|車\s*牌|車\s*型)\s*(?:姓\s*名)?\s*[：:；;]?", line):
+            continue
+        keep.append(line)
+    basis = re.sub(r"\s+", "", "\n".join(keep)).replace("臺", "台").upper()
+    digest = hashlib.sha1(basis.encode("utf-8")).hexdigest()[:10].upper()
+    return f"LINE{digest}"
+
+
 def parse_line_order_text(text: str) -> Optional[Order]:
     raw = html.unescape(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     if "出發日期" not in raw or "乘車人數" not in raw:
         return None
-    oid = extract_order_id(raw)
-    if not oid:
-        return None
+    oid = extract_order_id(raw) or _synthetic_line_order_id(raw)
     order = parse_order_row([raw, oid, "", "LINE"], 0)
     if not order or not order.date or not order.trip_type:
         return None
