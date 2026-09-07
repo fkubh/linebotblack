@@ -663,24 +663,47 @@ def _claim_rows():
     return _sheet_values(BOT_RECORD_SHEET_ID, f"'{BOT_CLAIM_TAB}'!A2:H")
 
 
+def _claim_has_driver_data(text):
+    """Only treat a third-group post as a claim when it includes driver details.
+
+    Required markers: 司機資料 + 姓名 + 車牌. This prevents daily checklists
+    containing many order IDs from being counted as claims.
+    """
+    raw = str(text or "")
+    if "司機資料" not in raw:
+        return False
+    has_name = bool(re.search(r"(?:姓名|司機姓名)\s*[：:]\s*\S+", raw))
+    has_plate = bool(re.search(r"(?:車牌|車號)\s*[：:]\s*[A-Z0-9-]+", raw, re.I))
+    return has_name and has_plate
+
+
 def _claim_first_by_order():
     """Return first recorded claimant for each order ID. Sheet is append-only."""
     first = {}
     for row in _claim_rows():
         row = list(row) + [""] * (8 - len(row))
         oid = str(row[5] or "").strip().upper()
-        if oid and oid not in first:
+        # V1.6.20: ignore historical checklist rows that had no driver data.
+        # This also allows a later valid driver assignment for the same order to be recorded.
+        if oid and _claim_has_driver_data(row[7]) and oid not in first:
             first[oid] = row[:8]
     return first
 
 
 def _capture_claim_activity(event, text):
-    """Record the first member in the third group who posts a known order ID.
+    """Record the first member in the third group who posts an order ID with driver data.
 
-    Only orders already present in LINE訂單 are counted as matched source orders.
+    A valid claim requires 司機資料 + 姓名 + 車牌. Only orders already present in
+    LINE訂單 are counted as matched source orders.
     Reposts, webhook redelivery and later users posting the same order never add a second score.
     """
     if not _is_claim_group(event):
+        return False
+
+    # V1.6.20: a checklist/order list alone is not a claim.
+    # It must contain a driver block with both driver name and plate.
+    if not _claim_has_driver_data(text):
+        app.logger.info("[CLAIM SKIP] no_driver_data user=%s", _line_user_id(event) or "-")
         return False
 
     order_ids = []
