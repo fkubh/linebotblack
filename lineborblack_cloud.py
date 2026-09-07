@@ -664,17 +664,34 @@ def _claim_rows():
 
 
 def _claim_has_driver_data(text):
-    """Only treat a third-group post as a claim when it includes driver details.
+    """Return True when a third-group post contains an actual driver assignment.
 
-    Required markers: 司機資料 + 姓名 + 車牌. This prevents daily checklists
-    containing many order IDs from being counted as claims.
+    Two supported formats:
+    1) Explicit block: 「司機資料」 + 姓名 + 車牌/車號.
+    2) Compact/shared block: 姓名 + 車牌/車號 + at least one supporting
+       driver field (電話/車款/車種).  This supports one message assigning the
+       same driver to multiple order IDs without requiring the 「司機資料」 title.
+
+    A plain checklist contains order IDs but normally has none of these driver
+    field combinations, so it is still excluded.
     """
     raw = str(text or "")
-    if "司機資料" not in raw:
+    has_name = bool(re.search(r"(?:^|\n)\s*(?:姓名|司機姓名)\s*[：:]\s*\S+", raw, re.M))
+    has_plate = bool(re.search(r"(?:^|\n)\s*(?:車牌|車號)\s*[：:]\s*[A-Z0-9-]+", raw, re.I | re.M))
+    if not (has_name and has_plate):
         return False
-    has_name = bool(re.search(r"(?:姓名|司機姓名)\s*[：:]\s*\S+", raw))
-    has_plate = bool(re.search(r"(?:車牌|車號)\s*[：:]\s*[A-Z0-9-]+", raw, re.I))
-    return has_name and has_plate
+
+    if "司機資料" in raw:
+        return True
+
+    # Some dispatch messages omit the literal 「司機資料」 heading and append
+    # one shared driver block after several order lines. Require one additional
+    # driver-specific field so a checklist is not accidentally scored.
+    has_supporting_field = bool(re.search(
+        r"(?:^|\n)\s*(?:電話|司機電話|車款|車種)\s*[：:]\s*\S+",
+        raw, re.I | re.M,
+    ))
+    return has_supporting_field
 
 
 def _claim_first_by_order():
@@ -683,7 +700,7 @@ def _claim_first_by_order():
     for row in _claim_rows():
         row = list(row) + [""] * (8 - len(row))
         oid = str(row[5] or "").strip().upper()
-        # V1.6.20: ignore historical checklist rows that had no driver data.
+        # V1.6.21: ignore historical checklist rows that do not contain a valid driver block.
         # This also allows a later valid driver assignment for the same order to be recorded.
         if oid and _claim_has_driver_data(row[7]) and oid not in first:
             first[oid] = row[:8]
@@ -693,15 +710,15 @@ def _claim_first_by_order():
 def _capture_claim_activity(event, text):
     """Record the first member in the third group who posts an order ID with driver data.
 
-    A valid claim requires 司機資料 + 姓名 + 車牌. Only orders already present in
+    A valid claim requires a recognized driver block. A single message may contain multiple\n    order IDs; each unique order is recorded for the same claimant/driver. Only orders already present in
     LINE訂單 are counted as matched source orders.
     Reposts, webhook redelivery and later users posting the same order never add a second score.
     """
     if not _is_claim_group(event):
         return False
 
-    # V1.6.20: a checklist/order list alone is not a claim.
-    # It must contain a driver block with both driver name and plate.
+    # V1.6.21: a checklist/order list alone is not a claim.
+    # Supports either an explicit 「司機資料」 block or a compact shared driver block.
     if not _claim_has_driver_data(text):
         app.logger.info("[CLAIM SKIP] no_driver_data user=%s", _line_user_id(event) or "-")
         return False

@@ -13,7 +13,7 @@ time, passenger count and current dispatch state.
 
 from __future__ import annotations
 
-PARSER_VERSION = "V1.6.20-20260908-driver-claim-only"
+PARSER_VERSION = "V1.6.21-20260908-multi-order-driver-claim"
 
 import argparse
 import html
