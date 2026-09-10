@@ -634,8 +634,17 @@ class GoogleSheetEventStore:
         self.spreadsheet_id = spreadsheet_id
         self.tab_name = tab_name
         self.events = []
+        self._events_by_order = {}
         _ensure_sheet_tab(spreadsheet_id, tab_name, self.HEADERS)
         self.load()
+
+    def _rebuild_index(self):
+        index = {}
+        for event in self.events:
+            index.setdefault(event.order_id.upper(), []).append(event)
+        for bucket in index.values():
+            bucket.sort(key=lambda e: e.at)
+        self._events_by_order = index
 
     def load(self):
         rows = _sheet_values(self.spreadsheet_id, f"'{self.tab_name}'!A2:H")
@@ -661,6 +670,8 @@ class GoogleSheetEventStore:
                 changes=changes,
             ))
         self.events = events
+        self._rebuild_index()
+        app.logger.info("[EVENT INDEX] events=%s orders=%s", len(self.events), len(self._events_by_order))
 
     def add(self, event):
         app.logger.info("[EVENT WRITE] order_id=%s type=%s at=%s", event.order_id, event.event_type, event.at)
@@ -674,6 +685,9 @@ class GoogleSheetEventStore:
             ],
         )
         self.events.append(event)
+        bucket = self._events_by_order.setdefault(event.order_id.upper(), [])
+        bucket.append(event)
+        bucket.sort(key=lambda e: e.at)
         app.logger.info("[EVENT OK] order_id=%s type=%s", event.order_id, event.event_type)
 
     def cleanup_older_than(self, cutoff):
@@ -693,17 +707,20 @@ class GoogleSheetEventStore:
         _sheet_write_rows(self.spreadsheet_id, f"'{self.tab_name}'!A2", rows)
         removed = len(self.events) - len(kept)
         self.events = kept
+        self._rebuild_index()
         return removed
 
     def for_order(self, order):
-        matched = []
-        for event in self.events:
-            if event.order_id.upper() != order.order_id.upper():
-                continue
-            if event.instance_key and event.instance_key != order.instance_key:
-                continue
-            matched.append(event)
-        return sorted(matched, key=lambda e: e.at)
+        # V1.6.17G: indexed lookup. The old implementation scanned the entire
+        # event list for every order, which made large summary requests hit
+        # Gunicorn's worker timeout.
+        bucket = self._events_by_order.get(order.order_id.upper(), [])
+        if not order.instance_key:
+            return list(bucket)
+        return [
+            event for event in bucket
+            if not event.instance_key or event.instance_key == order.instance_key
+        ]
 
 
 class GoogleSheetLineOrderStore:
@@ -1243,6 +1260,7 @@ def handle_order_v1_command(event, text):
             )
             orders = load_orders_for_date(cmd["date"])
             app.logger.info("[SUMMARY CMD] orders loaded date=%r count=%s", cmd.get("date"), len(orders))
+            _summary_started = time.monotonic()
             if cmd["command"] == "summary_unassigned":
                 summary = generate_unassigned_summary(
                     orders, cmd["date"], order_event_store
@@ -1254,8 +1272,9 @@ def handle_order_v1_command(event, text):
                     show_unassigned=ORDER_SHOW_UNASSIGNED,
                 )
 
+            _summary_elapsed = time.monotonic() - _summary_started
             chunks = _split_line_text(summary, max_chars=4800)
-            app.logger.info("[SUMMARY CMD] generated chars=%s chunks=%s", len(summary or ""), len(chunks))
+            app.logger.info("[SUMMARY CMD] generated chars=%s chunks=%s seconds=%.3f", len(summary or ""), len(chunks), _summary_elapsed)
 
             # V1.6.17E：避免 Invalid reply token，簡表內容全部以 push_message 傳送。
             for i in range(0, len(chunks), 5):

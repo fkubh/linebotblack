@@ -13,7 +13,7 @@ time, passenger count and current dispatch state.
 
 from __future__ import annotations
 
-PARSER_VERSION = "V1.6.17F-20260911-webhook-dedupe-replytoken-fix"
+PARSER_VERSION = "V1.6.17G-20260911-summary-performance-timeout-fix"
 
 import argparse
 import html
@@ -95,6 +95,7 @@ class EventStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.events: list[Event] = []
+        self._events_by_order: dict[str, list[Event]] = {}
         self.load()
 
     def load(self) -> None:
@@ -103,6 +104,15 @@ class EventStore:
             return
         data = json.loads(self.path.read_text(encoding="utf-8"))
         self.events = [Event(**item) for item in data]
+        self._rebuild_index()
+
+    def _rebuild_index(self) -> None:
+        index: dict[str, list[Event]] = {}
+        for event in self.events:
+            index.setdefault(event.order_id.upper(), []).append(event)
+        for bucket in index.values():
+            bucket.sort(key=lambda e: e.at)
+        self._events_by_order = index
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -113,17 +123,20 @@ class EventStore:
 
     def add(self, event: Event) -> None:
         self.events.append(event)
+        bucket = self._events_by_order.setdefault(event.order_id.upper(), [])
+        bucket.append(event)
+        bucket.sort(key=lambda e: e.at)
         self.save()
 
     def for_order(self, order: Order) -> list[Event]:
-        matched = []
-        for event in self.events:
-            if event.order_id.upper() != order.order_id.upper():
-                continue
-            if event.instance_key and event.instance_key != order.instance_key:
-                continue
-            matched.append(event)
-        return sorted(matched, key=lambda e: e.at)
+        # V1.6.17G: O(1) indexed lookup instead of scanning every event for every order.
+        bucket = self._events_by_order.get(order.order_id.upper(), [])
+        if not order.instance_key:
+            return list(bucket)
+        return [
+            event for event in bucket
+            if not event.instance_key or event.instance_key == order.instance_key
+        ]
 
 
 
