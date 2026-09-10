@@ -116,12 +116,6 @@ GOOGLE_SHEET_RETRY_BASE_SECONDS = max(0.2, float(os.environ.get("GOOGLE_SHEET_RE
 # 先部署後在兩群輸入「群組ID」取得 ID，再填入 Render 環境變數。
 PACKAGE_GROUP_ID = os.environ.get("PACKAGE_GROUP_ID", "Cbec1868a3b62f4210cb9ade284cd8409").strip()
 TEST_GROUP_ID = os.environ.get("TEST_GROUP_ID", "C89a73c61413eaa4d761ae9e2e11cf96f").strip()
-
-# V1.6.19：第三群組抓單統計。
-# 將 Bot 加入第三個群組後輸入「群組ID」，把取得的 C... 填到 Render：
-# CLAIM_GROUP_ID=Cxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-CLAIM_GROUP_ID = os.environ.get("CLAIM_GROUP_ID", "").strip()
-BOT_CLAIM_TAB = os.environ.get("BOT_CLAIM_TAB", "抓單紀錄").strip() or "抓單紀錄"
 BOT_RECORD_RETENTION_DAYS = int(os.environ.get("BOT_RECORD_RETENTION_DAYS", "60"))
 _cleanup_state = {"last_run": None}
 _processed_webhook_event_ids = set()
@@ -172,14 +166,6 @@ def _line_group_id(event):
 
 def _authorized_order_group_ids():
     return {gid for gid in (PACKAGE_GROUP_ID, TEST_GROUP_ID) if gid}
-
-
-def _is_claim_group(event):
-    return bool(
-        CLAIM_GROUP_ID
-        and _line_source_type(event) == "group"
-        and _line_group_id(event) == CLAIM_GROUP_ID
-    )
 
 
 def _line_event_id(event):
@@ -580,15 +566,6 @@ def _parse_record_time(value):
     text = str(value or "").strip()
     if not text:
         return None
-    # Most Bot timestamps come from datetime.isoformat(timespec="minutes"),
-    # e.g. 2026-09-08T00:16+08:00. fromisoformat handles both minute/second forms.
-    try:
-        dt = datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=ZoneInfo("Asia/Taipei"))
-        return dt.astimezone(ZoneInfo("Asia/Taipei"))
-    except ValueError:
-        pass
     for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"):
         try:
             dt = datetime.strptime(text, fmt)
@@ -644,197 +621,6 @@ def _load_processed_webhook_event_ids():
     except Exception as exc:
         app.logger.exception("[WEBHOOK DEDUPE ERROR] load failed: %r", exc)
         _processed_webhook_event_ids = set()
-
-
-CLAIM_HEADERS = [
-    "claimed_at", "event_id", "group_id", "user_id", "display_name",
-    "order_id", "matched_source", "message_excerpt",
-]
-
-_ORDER_ID_ANY_RE = re.compile(
-    r"\b(?:\d{2}KK\d{9}|ORD\d{10}|[A-Z]{3}\d{6}|[A-Z]{2}\d{2}[A-Z]\d{4})\b",
-    re.I,
-)
-
-
-def _claim_rows():
-    if not BOT_RECORD_SHEET_ID:
-        return []
-    return _sheet_values(BOT_RECORD_SHEET_ID, f"'{BOT_CLAIM_TAB}'!A2:H")
-
-
-def _claim_has_driver_data(text):
-    """Return True when a third-group post contains an actual driver assignment.
-
-    Two supported formats:
-    1) Explicit block: 「司機資料」 + 姓名 + 車牌/車號.
-    2) Compact/shared block: 姓名 + 車牌/車號 + at least one supporting
-       driver field (電話/車款/車種).  This supports one message assigning the
-       same driver to multiple order IDs without requiring the 「司機資料」 title.
-
-    A plain checklist contains order IDs but normally has none of these driver
-    field combinations, so it is still excluded.
-    """
-    raw = str(text or "")
-    has_name = bool(re.search(r"(?:^|\n)\s*(?:姓名|司機姓名)\s*[：:]\s*\S+", raw, re.M))
-    has_plate = bool(re.search(r"(?:^|\n)\s*(?:車牌|車號)\s*[：:]\s*[A-Z0-9-]+", raw, re.I | re.M))
-    if not (has_name and has_plate):
-        return False
-
-    if "司機資料" in raw:
-        return True
-
-    # Some dispatch messages omit the literal 「司機資料」 heading and append
-    # one shared driver block after several order lines. Require one additional
-    # driver-specific field so a checklist is not accidentally scored.
-    has_supporting_field = bool(re.search(
-        r"(?:^|\n)\s*(?:電話|司機電話|車款|車種)\s*[：:]\s*\S+",
-        raw, re.I | re.M,
-    ))
-    return has_supporting_field
-
-
-def _claim_first_by_order():
-    """Return first recorded claimant for each order ID. Sheet is append-only."""
-    first = {}
-    for row in _claim_rows():
-        row = list(row) + [""] * (8 - len(row))
-        oid = str(row[5] or "").strip().upper()
-        # V1.6.21: ignore historical checklist rows that do not contain a valid driver block.
-        # This also allows a later valid driver assignment for the same order to be recorded.
-        if oid and _claim_has_driver_data(row[7]) and oid not in first:
-            first[oid] = row[:8]
-    return first
-
-
-def _capture_claim_activity(event, text):
-    """Record the first member in the third group who posts an order ID with driver data.
-
-    A valid claim requires a recognized driver block. A single message may contain multiple\n    order IDs; each unique order is recorded for the same claimant/driver. Only orders already present in
-    LINE訂單 are counted as matched source orders.
-    Reposts, webhook redelivery and later users posting the same order never add a second score.
-    """
-    if not _is_claim_group(event):
-        return False
-
-    # V1.6.21: a checklist/order list alone is not a claim.
-    # Supports either an explicit 「司機資料」 block or a compact shared driver block.
-    if not _claim_has_driver_data(text):
-        app.logger.info("[CLAIM SKIP] no_driver_data user=%s", _line_user_id(event) or "-")
-        return False
-
-    order_ids = []
-    seen = set()
-    for m in _ORDER_ID_ANY_RE.finditer(text or ""):
-        oid = m.group(0).upper()
-        if oid not in seen:
-            seen.add(oid)
-            order_ids.append(oid)
-    if not order_ids:
-        return False
-
-    first = _claim_first_by_order()
-    name = _display_name_for_event(event)
-    uid = _line_user_id(event)
-    event_id = _line_event_id(event)
-    now = _taipei_now_iso()
-    recorded = 0
-
-    # Reload LINE訂單 so another worker / recent write is visible before matching.
-    try:
-        line_order_store.load()
-    except Exception as exc:
-        app.logger.warning("[CLAIM MATCH] reload LINE訂單 failed: %s", exc)
-
-    for oid in order_ids:
-        if oid in first:
-            app.logger.info("[CLAIM DUPLICATE] order_id=%s first_user=%s skipped=true", oid, first[oid][3])
-            continue
-
-        matched = bool(line_order_store.get(oid))
-        _sheet_append(
-            BOT_RECORD_SHEET_ID,
-            BOT_CLAIM_TAB,
-            [
-                now, event_id, _line_group_id(event), uid, name, oid,
-                "TRUE" if matched else "FALSE", str(text or "")[:1000],
-            ],
-        )
-        first[oid] = [now, event_id, _line_group_id(event), uid, name, oid, "TRUE" if matched else "FALSE", str(text or "")[:1000]]
-        recorded += 1
-        app.logger.info(
-            "[CLAIM RECORDED] order_id=%s user=%s name=%s matched=%s",
-            oid, uid or "-", name or "-", matched,
-        )
-
-    return recorded > 0
-
-
-def _claim_target_date(text):
-    """Parse `抓單統計 [M/D|全部] [password]`. Empty target means today."""
-    clean = (text or "").strip()
-    if SUMMARY_ACCESS_CODE:
-        parts = clean.split()
-        if parts and parts[-1] == SUMMARY_ACCESS_CODE:
-            clean = " ".join(parts[:-1]).strip()
-    m = re.match(r"^(?:抓單統計|抓單排行)(?:\s+(.+?))?$", clean)
-    if not m:
-        return None
-    target = (m.group(1) or "").strip()
-    if not target:
-        now = datetime.now(ZoneInfo("Asia/Taipei"))
-        return f"{now.month}/{now.day}"
-    if target in {"全部", "all", "ALL"}:
-        return "全部"
-    dm = re.fullmatch(r"0?(\d{1,2})\s*/\s*0?(\d{1,2})", target)
-    if not dm:
-        return "INVALID"
-    return f"{int(dm.group(1))}/{int(dm.group(2))}"
-
-
-def _claim_report(text):
-    target = _claim_target_date(text)
-    if target is None:
-        return None
-    if SUMMARY_ACCESS_CODE and not _summary_password_ok(text):
-        return "密碼錯誤。格式：抓單統計 9/8 9353"
-    if target == "INVALID":
-        return "格式：抓單統計 9/8 9353；或：抓單統計 全部 9353"
-
-    # Refresh source order records so previously-unmatched claims can become valid later.
-    try:
-        line_order_store.load()
-    except Exception as exc:
-        app.logger.warning("[CLAIM REPORT] reload LINE訂單 failed: %s", exc)
-
-    first = _claim_first_by_order()
-    counts = {}
-    details = []
-    for oid, row in first.items():
-        row = list(row) + [""] * (8 - len(row))
-        at, _event_id, _gid, uid, name, _oid, _matched, _msg = row[:8]
-        dt = _parse_record_time(at)
-        if target != "全部":
-            if dt is None or f"{dt.month}/{dt.day}" != target:
-                continue
-        # Comparison rule: only score orders that exist in the two source groups' LINE訂單 store.
-        if not line_order_store.get(oid):
-            continue
-        key = uid or (name or "未知使用者")
-        item = counts.setdefault(key, {"name": name or "未取得名稱", "count": 0})
-        item["count"] += 1
-        details.append((at, oid, item["name"]))
-
-    label = "全部紀錄" if target == "全部" else target
-    if not counts:
-        return f"{label} 抓單統計\n目前沒有可比對的抓單紀錄。"
-
-    ranked = sorted(counts.values(), key=lambda x: (-x["count"], x["name"]))
-    out = [f"{label} 抓單排行", ""]
-    for i, item in enumerate(ranked, 1):
-        out.append(f"{i}. {item['name']}｜{item['count']}單")
-    out.extend(["", f"共 {sum(x['count'] for x in ranked)} 單｜{len(ranked)} 人"])
-    return "\n".join(out)
 
 
 class GoogleSheetEventStore:
@@ -1023,7 +809,6 @@ def _init_google_sheet_persistence():
     if BOT_RAW_EVENT_LOG_ENABLED:
         _ensure_sheet_tab(BOT_RECORD_SHEET_ID, BOT_RAW_EVENT_TAB, RAW_EVENT_HEADERS)
         _load_processed_webhook_event_ids()
-    _ensure_sheet_tab(BOT_RECORD_SHEET_ID, BOT_CLAIM_TAB, CLAIM_HEADERS)
     app.logger.info(
         "V1.6.10 Bot永久紀錄已啟用：sheet=%s event_tab=%s line_tab=%s events=%s line_orders=%s",
         BOT_RECORD_SHEET_ID, BOT_EVENT_TAB, BOT_LINE_ORDER_TAB,
@@ -2173,28 +1958,6 @@ def handle_message(event):
             TextSendMessage(text=f"訂單解析器：{PARSER_VERSION}")
         )
         return
-
-    # V1.6.19：第三群組抓單排行。沿用簡表密碼。
-    claim_report = _claim_report(text)
-    if claim_report is not None:
-        try:
-            _record_bot_usage(event, "抓單統計")
-        except Exception:
-            pass
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=claim_report))
-        return
-
-    # 第三群組只做抓單紀錄，不寫入 LINE訂單／調度事件。
-    # 第一個貼出有效訂單編號的人得分；同一訂單之後重貼不重複計分。
-    if _is_claim_group(event):
-        try:
-            if _capture_claim_activity(event, text):
-                if event_id:
-                    _processed_webhook_event_ids.add(event_id)
-                return
-        except Exception as exc:
-            app.logger.exception("[CLAIM SAVE FAILED] event=%s error=%r", event_id or "(none)", exc)
-            raise
 
     # V1.6.16：先被動記錄 LINE 完整訂單／取消／拉回／改司機／訂單修正。
     # 這裡不可吞掉例外：寫 Sheet 失敗必須讓 /callback 回 500，交由 LINE redelivery。
