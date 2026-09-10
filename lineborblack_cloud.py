@@ -1213,8 +1213,23 @@ def handle_order_v1_command(event, text):
             return True
         app.logger.info("[SUMMARY CMD] password ok command=%s date=%r", cmd.get("command"), cmd.get("date"))
 
+        # V1.6.17E：簡表需要讀 Google Sheet，可能超過 LINE reply token 的有效時間。
+        # 先立即用 reply token 回覆查詢中，後續簡表一律改用 push_message 回原聊天來源。
+        try:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="📋 簡表查詢中，資料整理完成後會自動送出。")
+            )
+            app.logger.info("[SUMMARY CMD] ack reply success")
+        except Exception as ack_exc:
+            app.logger.warning("[SUMMARY CMD] ack reply failed: %s", ack_exc)
+
     try:
         if cmd["command"] in {"summary", "summary_unassigned"}:
+            target_id = _line_source_target_id(event)
+            if not target_id:
+                raise RuntimeError("無法取得 LINE 回覆目標 ID")
+
             # V1.6.11：每次查詢前都以永久 Google Sheet 最新資料為準，
             # 不依賴目前 Render worker 的舊記憶體快取。
             app.logger.info("[SUMMARY CMD] refreshing order state from Google Sheet")
@@ -1237,23 +1252,19 @@ def handle_order_v1_command(event, text):
                     include_cancelled=True,
                     show_unassigned=ORDER_SHOW_UNASSIGNED,
                 )
-            # LINE 單一文字訊息有長度上限。舊版使用 summary[:5000]，
-            # 訂單量大時會直接把後半段簡表截掉。V1.2 改成依換行安全分段，
-            # 一次 reply 最多可帶 5 則訊息；8/28 這類 7k+ 字簡表會完整分成 2 則。
+
             chunks = _split_line_text(summary, max_chars=4800)
             app.logger.info("[SUMMARY CMD] generated chars=%s chunks=%s", len(summary or ""), len(chunks))
-            messages = [TextSendMessage(text=chunk) for chunk in chunks[:5]]
-            app.logger.info("[SUMMARY CMD] replying reply_chunks=%s", len(messages))
-            line_bot_api.reply_message(event.reply_token, messages)
-            app.logger.info("[SUMMARY CMD] reply success")
 
-            # 極端情況若超過 5 段，再用 push 補送剩餘內容。
-            if len(chunks) > 5:
-                target_id = _line_source_target_id(event)
-                if target_id:
-                    for i in range(5, len(chunks), 5):
-                        batch = [TextSendMessage(text=chunk) for chunk in chunks[i:i + 5]]
-                        line_bot_api.push_message(target_id, batch)
+            # V1.6.17E：避免 Invalid reply token，簡表內容全部以 push_message 傳送。
+            for i in range(0, len(chunks), 5):
+                batch = [TextSendMessage(text=chunk) for chunk in chunks[i:i + 5]]
+                app.logger.info(
+                    "[SUMMARY CMD] pushing batch=%s-%s target=%s",
+                    i + 1, min(i + len(batch), len(chunks)), str(target_id)[:24],
+                )
+                line_bot_api.push_message(target_id, batch)
+            app.logger.info("[SUMMARY CMD] push success chunks=%s", len(chunks))
             return True
 
         if cmd["command"] == "history":
@@ -1290,6 +1301,19 @@ def handle_order_v1_command(event, text):
             return True
     except Exception as exc:
         app.logger.exception("[SUMMARY CMD] failed: %s", exc)
+        # V1.6.17E：簡表已先消耗 reply token，錯誤通知也必須用 push。
+        if cmd.get("command") in {"summary", "summary_unassigned"}:
+            target_id = _line_source_target_id(event)
+            if target_id:
+                try:
+                    line_bot_api.push_message(
+                        target_id,
+                        TextSendMessage(text=f"⚠️ 簡表產生失敗：{exc}")
+                    )
+                except Exception:
+                    app.logger.exception("[SUMMARY CMD] failure push also failed")
+            return True
+
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text=f"⚠️ 訂單功能處理失敗：{exc}")
