@@ -1173,8 +1173,26 @@ def _refresh_order_state_from_sheet():
 def handle_order_v1_command(event, text):
     raw_text = text
     command_text = _strip_summary_password(raw_text)
+    is_summary_like = bool(re.match(r"^(?:簡表|未派)(?:\s|$)", str(raw_text or "")))
+    if is_summary_like:
+        app.logger.info(
+            "[SUMMARY CMD] received raw=%r stripped=%r",
+            str(raw_text or "")[:300], command_text[:300],
+        )
     cmd = parse_line_command(command_text)
     if not cmd:
+        if is_summary_like:
+            app.logger.warning("[SUMMARY CMD] parse failed stripped=%r", command_text[:300])
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="簡表指令格式錯誤，請輸入：未派 9/11 9353 或 簡表 9/11 9353")
+                )
+                app.logger.info("[SUMMARY CMD] parse-fail reply success")
+                return True
+            except Exception:
+                app.logger.exception("[SUMMARY CMD] parse-fail reply failed")
+                raise
         return False
 
     # V1.6.3：簡表改為密碼制，且預設只能私訊 Bot 查詢。
@@ -1183,6 +1201,7 @@ def handle_order_v1_command(event, text):
 
         # V1.6.5：群組與私訊都可查簡表，只驗證密碼，不再限制必須私訊。
         if not _summary_password_ok(raw_text):
+            app.logger.warning("[SUMMARY CMD] password failed command=%s", cmd.get("command"))
             try:
                 _record_bot_usage(event, action_name, "密碼錯誤")
             except Exception:
@@ -1192,18 +1211,22 @@ def handle_order_v1_command(event, text):
                 TextSendMessage(text="簡表密碼錯誤。")
             )
             return True
+        app.logger.info("[SUMMARY CMD] password ok command=%s date=%r", cmd.get("command"), cmd.get("date"))
 
     try:
         if cmd["command"] in {"summary", "summary_unassigned"}:
             # V1.6.11：每次查詢前都以永久 Google Sheet 最新資料為準，
             # 不依賴目前 Render worker 的舊記憶體快取。
+            app.logger.info("[SUMMARY CMD] refreshing order state from Google Sheet")
             _refresh_order_state_from_sheet()
+            app.logger.info("[SUMMARY CMD] refresh complete")
             _record_bot_usage(
                 event,
                 "未派簡表查詢" if cmd["command"] == "summary_unassigned" else "完整簡表查詢",
                 "成功",
             )
             orders = load_orders_for_date(cmd["date"])
+            app.logger.info("[SUMMARY CMD] orders loaded date=%r count=%s", cmd.get("date"), len(orders))
             if cmd["command"] == "summary_unassigned":
                 summary = generate_unassigned_summary(
                     orders, cmd["date"], order_event_store
@@ -1218,8 +1241,11 @@ def handle_order_v1_command(event, text):
             # 訂單量大時會直接把後半段簡表截掉。V1.2 改成依換行安全分段，
             # 一次 reply 最多可帶 5 則訊息；8/28 這類 7k+ 字簡表會完整分成 2 則。
             chunks = _split_line_text(summary, max_chars=4800)
+            app.logger.info("[SUMMARY CMD] generated chars=%s chunks=%s", len(summary or ""), len(chunks))
             messages = [TextSendMessage(text=chunk) for chunk in chunks[:5]]
+            app.logger.info("[SUMMARY CMD] replying reply_chunks=%s", len(messages))
             line_bot_api.reply_message(event.reply_token, messages)
+            app.logger.info("[SUMMARY CMD] reply success")
 
             # 極端情況若超過 5 段，再用 push 補送剩餘內容。
             if len(chunks) > 5:
@@ -1263,7 +1289,7 @@ def handle_order_v1_command(event, text):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return True
     except Exception as exc:
-        app.logger.exception("訂單 V1 指令失敗：%s", exc)
+        app.logger.exception("[SUMMARY CMD] failed: %s", exc)
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text=f"⚠️ 訂單功能處理失敗：{exc}")
@@ -1958,6 +1984,13 @@ def handle_message(event):
             TextSendMessage(text=f"訂單解析器：{PARSER_VERSION}")
         )
         return
+
+    # V1.6.17D：簡表/未派指令優先處理。
+    # 避免被訂單擷取、黑名單 Google Sheet 載入或黑名單比對提前 return。
+    if re.match(r"^(?:簡表|未派)(?:\s|$)", text):
+        app.logger.info("[SUMMARY CMD] early route text=%r", text[:300])
+        if handle_order_v1_command(event, text):
+            return
 
     # V1.6.16：先被動記錄 LINE 完整訂單／取消／拉回／改司機／訂單修正。
     # 這裡不可吞掉例外：寫 Sheet 失敗必須讓 /callback 回 500，交由 LINE redelivery。

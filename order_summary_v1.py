@@ -13,7 +13,7 @@ time, passenger count and current dispatch state.
 
 from __future__ import annotations
 
-PARSER_VERSION = "V1.6.17-20260904-line-summary-time-fix"
+PARSER_VERSION = "V1.6.17D-20260911-summary-diagnostic-fix"
 
 import argparse
 import html
