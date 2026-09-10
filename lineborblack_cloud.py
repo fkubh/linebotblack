@@ -22,7 +22,8 @@ from linebot import (
 )
 
 from linebot.exceptions import (
-    InvalidSignatureError
+    InvalidSignatureError,
+    LineBotApiError,
 )
 
 from linebot.models import (
@@ -1906,6 +1907,16 @@ def callback():
 
         abort(400)
 
+    except LineBotApiError as exc:
+        # V1.6.17F：reply token 已使用/過期時，不可回 500，否則 LINE redelivery
+        # 會把同一事件再次送進來，形成重複處理循環。
+        msg = str(exc)
+        if "Invalid reply token" in msg:
+            app.logger.warning("[WEBHOOK REPLY TOKEN] invalid token ignored; return 200")
+            return "OK", 200
+        app.logger.exception("[WEBHOOK LINE API ERROR] handler failed: %r", exc)
+        return "ERROR", 500
+
     except Exception as exc:
         app.logger.exception("[WEBHOOK ERROR] handler failed: %r", exc)
         return "ERROR", 500
@@ -2003,16 +2014,30 @@ def handle_message(event):
             _record_bot_usage(event, "版本查詢")
         except Exception:
             pass
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=f"訂單解析器：{PARSER_VERSION}")
-        )
+        # V1.6.17F：互動指令也要納入 event_id 去重；否則 redelivery 會再次
+        # 使用同一個 reply token，造成 Invalid reply token / callback 500。
+        if event_id:
+            _processed_webhook_event_ids.add(event_id)
+        try:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"訂單解析器：{PARSER_VERSION}")
+            )
+        except LineBotApiError as exc:
+            if "Invalid reply token" in str(exc):
+                app.logger.warning("[VERSION CMD] invalid reply token ignored event=%s", event_id or "(none)")
+                return
+            raise
         return
 
     # V1.6.17D：簡表/未派指令優先處理。
     # 避免被訂單擷取、黑名單 Google Sheet 載入或黑名單比對提前 return。
     if re.match(r"^(?:簡表|未派)(?:\s|$)", text):
         app.logger.info("[SUMMARY CMD] early route text=%r", text[:300])
+        # V1.6.17F：簡表後續以 push_message 傳送，不需要靠 redelivery 重跑。
+        # 先鎖住 event_id，避免同一事件重送後再次消耗 reply token/重複 push。
+        if event_id:
+            _processed_webhook_event_ids.add(event_id)
         if handle_order_v1_command(event, text):
             return
 
