@@ -1,4 +1,7 @@
 import os
+import sys
+import hmac
+from reliable_orders import ReliableOrders
 import re
 import json
 import time
@@ -39,6 +42,13 @@ from linebot.models import (
 # =====================================================
 
 app = Flask(__name__)
+_order_write_batch = None
+_reliable_skip_capture = False
+REPLAY_SECRET = os.environ.get("REPLAY_SECRET", "")
+if len(REPLAY_SECRET) < 32:
+    raise RuntimeError("請設定至少 32 字元的隨機 REPLAY_SECRET，供安全補處理使用")
+BOT_INBOX_TAB = os.environ.get("BOT_INBOX_TAB", "訂單收件匣").strip() or "訂單收件匣"
+
 
 
 # =====================================================
@@ -110,7 +120,7 @@ BOT_LINE_ORDER_TAB = os.environ.get("BOT_LINE_ORDER_TAB", "LINE訂單").strip() 
 
 # V1.6.16：Webhook / Google Sheet 漏單追蹤。
 BOT_RAW_EVENT_TAB = os.environ.get("BOT_RAW_EVENT_TAB", "LINE原始事件").strip() or "LINE原始事件"
-BOT_RAW_EVENT_LOG_ENABLED = os.environ.get("BOT_RAW_EVENT_LOG_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+BOT_RAW_EVENT_LOG_ENABLED = os.environ.get("BOT_RAW_EVENT_LOG_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 GOOGLE_SHEET_RETRY_ATTEMPTS = max(1, int(os.environ.get("GOOGLE_SHEET_RETRY_ATTEMPTS", "3")))
 GOOGLE_SHEET_RETRY_BASE_SECONDS = max(0.2, float(os.environ.get("GOOGLE_SHEET_RETRY_BASE_SECONDS", "1.0")))
 
@@ -306,6 +316,9 @@ def _save_usage(data):
 
 
 def _record_bot_usage(event, action, result="成功"):
+    if _order_write_batch is not None:
+        return  # Order replay must not call LINE profiles or write local usage files.
+
     """只記誰、何時、在哪裡觸發了哪個 Bot 功能；不保存原始訊息內容或密碼。"""
     user_id = _line_user_id(event)
     if not user_id:
@@ -565,6 +578,12 @@ def _ensure_sheet_tab(spreadsheet_id, tab_name, headers):
 
 
 def _sheet_append(spreadsheet_id, tab_name, values):
+    if _order_write_batch is not None:
+        if spreadsheet_id != BOT_RECORD_SHEET_ID:
+            raise RuntimeError("可靠訂單寫入必須與收件匣在同一份試算表")
+        _order_write_batch.append((tab_name, list(values)))
+        return
+
     encoded_range = quote(f"'{tab_name}'!A:Z", safe="")
     url = (
         f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
@@ -849,18 +868,9 @@ class GoogleSheetLineOrderStore:
 
 
 def _cleanup_google_sheet_records(force=False):
-    now = datetime.now(ZoneInfo("Asia/Taipei"))
-    last = _cleanup_state.get("last_run")
-    if not force and last and now - last < timedelta(hours=24):
-        return
-    cutoff = now - timedelta(days=max(1, BOT_RECORD_RETENTION_DAYS))
-    removed_events = order_event_store.cleanup_older_than(cutoff)
-    removed_line = line_order_store.cleanup_older_than(cutoff)
-    _cleanup_state["last_run"] = now
-    app.logger.info(
-        "V1.6.10 60天清理完成：cutoff=%s events_removed=%s line_rows_removed=%s",
-        cutoff.strftime("%Y-%m-%d %H:%M"), removed_events, removed_line,
-    )
+    # Reliability release: never clear-and-rewrite live ledgers automatically.
+    # An interruption could lose records. Retention now requires planned archiving.
+    return
 
 
 def _init_google_sheet_persistence():
@@ -1017,20 +1027,7 @@ def _latest_event(order_id, event_type=None):
 
 
 def _add_event(event_obj):
-    # LINE webhook retry / repeated paste protection: skip an identical latest event
-    # within the same Taipei minute.
-    events = _events_for_order_id(event_obj.order_id)
-    if events:
-        old = events[-1]
-        if (
-            old.at == event_obj.at
-            and old.event_type == event_obj.event_type
-            and old.driver_name == event_obj.driver_name
-            and old.plate == event_obj.plate
-            and old.note == event_obj.note
-            and (old.changes or {}) == (event_obj.changes or {})
-        ):
-            return
+    # Receipt event IDs, rather than same-minute text, govern duplicate handling.
     order_event_store.add(event_obj)
 
 
@@ -1057,7 +1054,7 @@ def capture_line_activity(event, text):
         _cleanup_google_sheet_records()
     except Exception as exc:
         app.logger.warning("60天紀錄清理失敗（不影響本次訊息）：%s", exc)
-    now = _taipei_now_iso()
+    now = _order_event_time(event)
     full_order = parse_line_order_text(text)
     oid_match = re.search(r"\b(?:\d{2}KK\d{9}|ORD\d{10}|[A-Z]{3}\d{6}|[A-Z]{2}\d{2}[A-Z]\d{4})\b", text, re.I)
     oid = full_order.order_id if full_order else (oid_match.group(0).upper() if oid_match else "")
@@ -1072,9 +1069,9 @@ def capture_line_activity(event, text):
         existing_line = line_order_store.get(full_order.order_id)
         try:
             sheet_orders = _sheet_orders_only_for_date(full_order.date)
-        except Exception as exc:
-            app.logger.warning("讀取 Sheet 做 LINE 衝突檢查失敗：%s", exc)
-            sheet_orders = []
+        except Exception:
+            # Unknown source data must not be treated as an empty source sheet.
+            raise
 
         sheet_same_id = [o for o in sheet_orders if o.order_id.upper() == full_order.order_id.upper()]
         reference = existing_line.order if existing_line else (sheet_same_id[0] if len(sheet_same_id) == 1 else None)
@@ -1243,6 +1240,9 @@ def handle_order_v1_command(event, text):
             str(raw_text or "")[:300], command_text[:300],
         )
     cmd = parse_line_command(command_text)
+    if cmd and cmd['command'] == 'event' and not _is_authorized_order_source(event):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="訂單調度僅接受已授權群組。"))
+        return True
     if not cmd:
         if is_summary_like:
             app.logger.warning("[SUMMARY CMD] parse failed stripped=%r", command_text[:300])
@@ -1275,6 +1275,11 @@ def handle_order_v1_command(event, text):
             )
             return True
         app.logger.info("[SUMMARY CMD] password ok command=%s date=%r", cmd.get("command"), cmd.get("date"))
+        reliable_orders.drain(limit=3, budget=25)
+        if reliable_orders.report()['pending']:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="收件匣尚有訂單等待處理，暫不產生簡表。請管理員私訊「漏單檢查」或「補處理訂單」。"))
+            return True
 
         # V1.6.17E：簡表需要讀 Google Sheet，可能超過 LINE reply token 的有效時間。
         # 先立即用 reply token 回覆查詢中，後續簡表一律改用 push_message 回原聊天來源。
@@ -1318,6 +1323,10 @@ def handle_order_v1_command(event, text):
                 )
 
             _summary_elapsed = time.monotonic() - _summary_started
+            inbox_report = reliable_orders.report()
+            if inbox_report['pending'] or inbox_report['counts'].get('REVIEW', 0):
+                summary = (f"⚠️ 收件匣待重試 {inbox_report['pending']} 筆、待人工確認 "
+                           f"{inbox_report['counts'].get('REVIEW', 0)} 筆；本簡表可能尚未包含這些訊息。\n\n" + summary)
             chunks = _split_line_text(summary, max_chars=4800)
             app.logger.info("[SUMMARY CMD] generated chars=%s chunks=%s seconds=%.3f", len(summary or ""), len(chunks), _summary_elapsed)
 
@@ -1935,11 +1944,12 @@ def _log_boot_memory(stage):
 _log_boot_memory("before-sheet-init")
 _init_google_sheet_persistence()
 _log_boot_memory("after-sheet-init")
+reliable_orders = ReliableOrders(sys.modules[__name__], BOT_INBOX_TAB)
 
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return f"LINE bot is running | order parser {PARSER_VERSION}", 200
+    return f"LINE bot is running | reliable-inbox-v1 | order parser {PARSER_VERSION}", 200
 
 
 # =====================================================
@@ -2006,11 +2016,7 @@ def callback():
 # 收到 LINE 文字訊息
 # =====================================================
 
-@handler.add(
-    MessageEvent,
-    message=TextMessage
-)
-def handle_message(event):
+def _handle_message_business(event):
 
     text = event.message.text.strip()
     event_id = _line_event_id(event)
@@ -2023,7 +2029,7 @@ def handle_message(event):
         app.logger.info("[LINE DUPLICATE] event=%s redelivery=%s skipped=true", event_id, _line_is_redelivery(event))
         return
 
-    if _is_authorized_order_source(event):
+    if _is_authorized_order_source(event) and not _reliable_skip_capture:
         _raw_event_log(event, text, "RECEIVED")
 
     # 記錄「誰曾經私訊過 Bot」；不保存訊息內容。
@@ -2098,7 +2104,7 @@ def handle_message(event):
         try:
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text=f"訂單解析器：{PARSER_VERSION}")
+                TextSendMessage(text=f"訂單解析器：{PARSER_VERSION}\n訂單保護：reliable-inbox-v1")
             )
         except LineBotApiError as exc:
             if "Invalid reply token" in str(exc):
@@ -2121,8 +2127,8 @@ def handle_message(event):
     # V1.6.16：先被動記錄 LINE 完整訂單／取消／拉回／改司機／訂單修正。
     # 這裡不可吞掉例外：寫 Sheet 失敗必須讓 /callback 回 500，交由 LINE redelivery。
     try:
-        captured_only = capture_line_activity(event, text)
-        if _is_authorized_order_source(event):
+        captured_only = False if _reliable_skip_capture else capture_line_activity(event, text)
+        if _is_authorized_order_source(event) and not _reliable_skip_capture:
             parsed = parse_line_order_text(text)
             _raw_event_log(
                 event, text, "PROCESSED",
@@ -2272,6 +2278,139 @@ def handle_message(event):
     # =================================================
     if handle_order_v1_command(event, text):
         return
+
+
+
+def _order_event_time(event):
+    stamp = getattr(event, "timestamp", None)
+    if stamp:
+        return datetime.fromtimestamp(int(stamp) / 1000, ZoneInfo("Asia/Taipei")).isoformat(timespec="seconds")
+    return _taipei_now_iso()
+
+
+def _is_informational_command(text):
+    simple = {"我的ID", "我的id", "我的 Id", "我的權限", "權限", "群組ID", "群組id",
+              "Group ID", "group id", "版本", "訂單版本", "parser version",
+              "誰私訊過機器人", "誰私訊過Bot", "私訊紀錄", "訊息紀錄", "使用紀錄",
+              "觸發紀錄", "誰使用過機器人", "誰觸發過機器人", "Bot使用紀錄"}
+    if text in simple or re.match(r"^(?:簡表|未派)(?:\s|$)", text):
+        return True
+    cmd = parse_line_command(text)
+    return bool(cmd and cmd["command"] == "history")
+
+
+def _plan_reliable_order(event):
+    if not _is_authorized_order_source(event):
+        return {"kind": "review", "detail": "來源群組目前未授權，保留待確認"}
+    message = getattr(event, "message", None)
+    if not isinstance(message, TextMessage):
+        return {"kind": "review", "detail": "非文字訊息；已保存事件資訊，附件內容須人工確認"}
+    text = message.text.strip()
+    cmd = parse_line_command(text)
+    if cmd and cmd["command"] == "event":
+        _add_event(Event(order_id=cmd["order_id"], event_type=cmd["event_type"],
+                         at=_order_event_time(event), driver_name=cmd.get("driver_name", ""),
+                         plate=cmd.get("plate", ""), note=cmd.get("note", ""), changes=cmd.get("changes", {})))
+        return {"kind": "saved", "order_id": cmd["order_id"], "captured_only": True,
+                "reply": f"✅ {cmd['order_id']} 調度狀態已保存（{cmd['event_type']}）"}
+    full = parse_line_order_text(text)
+    captured_only = capture_line_activity(event, text)
+    has_conflict = any(tab == BOT_EVENT_TAB and len(values) > 1 and values[1] == "conflict"
+                       for tab, values in _order_write_batch)
+    if has_conflict:
+        return {"kind": "review", "order_id": full.order_id if full else "", "detail": "同編號內容衝突，需人工確認", "captured_only": captured_only}
+    if full or _order_write_batch:
+        written_id = next((str(values[0]) for tab, values in _order_write_batch
+                           if tab in {BOT_EVENT_TAB, BOT_LINE_ORDER_TAB} and values), "")
+        return {"kind": "saved", "order_id": full.order_id if full else written_id,
+                "captured_only": captured_only, "detail": "訂單或調度已保存／確認既有資料"}
+    return {"kind": "review", "detail": "未辨識成完整訂單或調度指令，保留原文待人工確認", "captured_only": False}
+
+
+def _admin_inbox_command(event, text):
+    review_action = re.fullmatch(r"(結案訊息|重試訊息)\s+(\S+)", text)
+    if text not in {"漏單檢查", "補處理訂單"} and not review_action:
+        return False
+    if not SUMMARY_ADMIN_USER_ID or _line_user_id(event) != SUMMARY_ADMIN_USER_ID or not _is_private_line_chat(event):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請由已設定的管理員私訊使用此指令。"))
+        return True
+    if review_action:
+        try:
+            reliable_orders.review_action(review_action[2], _line_user_id(event), retry=review_action[1] == '重試訊息')
+            message = "已排入重新解析。" if review_action[1] == '重試訊息' else "已記錄人工結案；本操作不會新增訂單。"
+        except ValueError as exc:
+            message = str(exc)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=message))
+        return True
+    if text == "補處理訂單":
+        reliable_orders.drain(limit=3, refresh=True)
+    else:
+        reliable_orders.refresh()
+    report = reliable_orders.report()
+    lines = ["訂單收件匣", f"待重試：{report['pending']}",
+             f"待人工確認：{report['counts'].get('REVIEW', 0)}",
+             f"已完成：{report['counts'].get('DONE', 0)}",
+             "待確認事件 ID（最多20筆）：", *report['review_event_ids'],
+             "請到 Google Sheets 的訂單收件匣查看原文與原因。"]
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(lines)[:4800]))
+    return True
+
+
+@app.route("/internal/replay", methods=["POST"])
+def replay_orders():
+    auth = request.headers.get("Authorization", "")
+    if not hmac.compare_digest(auth.encode('utf-8'), ("Bearer " + REPLAY_SECRET).encode('utf-8')):
+        abort(403)
+    try:
+        reliable_orders.drain(limit=3, budget=25, refresh=True)
+        return reliable_orders.report(), 200
+    except Exception:
+        app.logger.exception("[INBOX REPLAY FAILED]")
+        return {"error": "inbox_unavailable"}, 503
+
+
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    global _reliable_skip_capture
+    text = event.message.text.strip()
+    if _admin_inbox_command(event, text):
+        return
+    if not _is_authorized_order_source(event):
+        return _handle_message_business(event)
+    command = _is_informational_command(text)
+    eid, new = reliable_orders.receive(event, command=command)
+    if command:
+        # Queries carry no order writes and must not be replayed with old tokens.
+        if new:
+            if re.match(r"^(?:簡表|未派)(?:\s|$)", text):
+                reliable_orders.drain(limit=3, budget=25)
+                if reliable_orders.report()['pending']:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                        text="收件匣尚有訂單等待處理；請管理員先私訊「補處理訂單」及「漏單檢查」，避免取得尚未完整的簡表。"))
+                    return
+            return _handle_message_business(event)
+        return
+    results = reliable_orders.drain(limit=3, budget=25)
+    result = results.get(eid)
+    if not result:
+        return  # Durable receipt exists. Timer/manual replay will resume it.
+    if result.get("reply"):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result["reply"]))
+        return
+    if result.get("captured_only"):
+        return
+    _reliable_skip_capture = True
+    try:
+        return _handle_message_business(event)
+    finally:
+        _reliable_skip_capture = False
+
+
+@handler.add(MessageEvent)
+def handle_other_message(event):
+    if _is_authorized_order_source(event):
+        reliable_orders.receive(event)
+        reliable_orders.drain(limit=3, budget=25)
 
 
 # =====================================================

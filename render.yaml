@@ -21,3 +21,13 @@ services:
         sync: false
       - key: ORDER_SHEET_ID
         sync: false
+      - key: REPLAY_SECRET
+        sync: false
+      - key: SUMMARY_ADMIN_USER_ID
+        sync: false
+      - key: PACKAGE_GROUP_ID
+        sync: false
+      - key: TEST_GROUP_ID
+        sync: false
+      - key: BOT_RAW_EVENT_LOG_ENABLED
+        value: "false"
