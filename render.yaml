@@ -5,7 +5,7 @@ services:
     plan: free
     buildCommand: pip install --no-cache-dir -r requirements.txt
     startCommand: gunicorn --config gunicorn.conf.py lineborblack_cloud:app
-    healthCheckPath: /
+    healthCheckPath: /ready
     envVars:
       - key: WEB_CONCURRENCY
         value: "1"

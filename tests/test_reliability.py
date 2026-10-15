@@ -107,8 +107,11 @@ db = Sheets()
 google_patch = patch('requests.request', side_effect=lambda *a, **k: db.request(*a, **k))
 creds_patch = patch('google.oauth2.service_account.Credentials.from_service_account_info', return_value=Mock(valid=True, token='dummy'))
 google_patch.start(); creds_patch.start()
-import lineborblack_cloud as bot
+with patch('threading.Thread.start'):
+    import lineborblack_cloud as bot
 bot.app.logger.disabled = True
+bot._initialize_storage()
+assert bot._storage_state['ready']
 
 ORDER = 'MKJ423828 送機\n出發日期：10/15 10:45\n乘車人數：2\n上車地點：台北市信義區\n下車地點：桃園機場'
 
@@ -117,6 +120,9 @@ class ReliabilityTests(unittest.TestCase):
     def setUp(self):
         global db
         db = Sheets()
+        bot._sheet_metadata_cache.clear()
+        bot._sheets_gate.reset()
+        bot._storage_state.update(ready=True, initializing=False, last_error=None, next_retry=0.0)
         bot._processed_webhook_event_ids = set()
         bot._order_write_batch = None
         bot.order_event_store.load(); bot.line_order_store.load()
@@ -321,6 +327,7 @@ class ReliabilityTests(unittest.TestCase):
         bot.reliable_orders.receive(event)
         header, row = db.tabs['訂單收件匣']['rows']
         db.tabs['訂單收件匣']['rows'] = [header] + [[] for _ in range(1000)] + [row]
+        bot._sheet_metadata_cache.clear()  # a fresh process has no metadata cache
         bot.reliable_orders = bot.ReliableOrders(bot, bot.BOT_INBOX_TAB)
         self.assertEqual(bot.reliable_orders.index['e1']['row'], 1002)
         self.replay()
@@ -356,6 +363,97 @@ class ReliabilityTests(unittest.TestCase):
         self.send()
         with self.assertRaises(ValueError):
             bot.reliable_orders.review_action('e1', 'Uadmin', retry=True)
+
+    def test_web_stays_live_but_orders_not_acknowledged_before_storage_ready(self):
+        bot._storage_state.update(ready=False, initializing=True)
+        self.assertEqual(self.client.get('/').status_code, 200)
+        self.assertIn('storage=NOT_READY', self.client.get('/').text)
+        self.assertEqual(self.client.get('/ready').status_code, 503)
+        response = self.send()
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.headers['Retry-After'], '60')
+        self.assertEqual(len(db.tabs['訂單收件匣']['rows']), 1)
+        self.assertEqual(self.replay().status_code, 503)
+        self.assertEqual(self.client.post('/callback', data='{}', headers={'X-Line-Signature':'bad'}).status_code, 400)
+
+    def test_bootstrap_failure_does_not_exit_or_ack_orders(self):
+        bot._storage_state.update(ready=False, initializing=True)
+        with patch.object(bot, '_init_google_sheet_persistence', side_effect=ConnectionError('offline')):
+            bot._initialize_storage()
+        self.assertFalse(bot._storage_state['ready'])
+        self.assertFalse(bot._storage_state['initializing'])
+        self.assertEqual(bot._storage_state['last_error'], 'ConnectionError')
+        self.assertGreater(bot._storage_state['next_retry'], 0)
+        self.assertEqual(self.send().status_code, 503)
+        self.assertEqual(self.client.get('/').status_code, 200)
+
+    def test_bootstrap_starts_only_one_background_thread(self):
+        bot._storage_state.update(ready=False, initializing=False)
+        with patch.object(bot.threading, 'Thread') as thread:
+            bot._start_storage_init(); bot._start_storage_init()
+            self.assertEqual(thread.call_count, 1)
+            self.assertTrue(thread.call_args.kwargs['daemon'])
+            self.assertEqual(thread.call_args.kwargs['name'], 'sheet-bootstrap')
+
+    def test_metadata_cache_and_invalidation_after_grid_growth(self):
+        bot._sheet_metadata_cache.clear()
+        original = db.request
+        seen = []
+        def count(*args, **kwargs):
+            if '?fields=sheets.properties' in args[1]:
+                seen.append(1)
+            return original(*args, **kwargs)
+        with patch.object(db, 'request', side_effect=count):
+            bot._sheet_metadata('records'); bot._sheet_metadata('records')
+            self.assertEqual(len(seen), 1)
+            bot._sheet_append('records', 'LINE原始事件', ['new-data'])
+            bot._sheet_metadata('records')
+            self.assertEqual(len(seen), 2)
+
+    def test_429_does_not_immediately_bombard_api(self):
+        response = Mock(status_code=429, headers={'Retry-After': '90'})
+        response.raise_for_status.side_effect = bot.requests.HTTPError('quota', response=response)
+        with patch.object(bot.requests, 'request', return_value=response) as request, patch.object(bot.time, 'sleep') as sleep:
+            with self.assertRaises(bot.requests.HTTPError):
+                bot._google_request('GET', 'https://sheets.googleapis.com/v4/spreadsheets/records', timeout=15)
+            self.assertEqual(request.call_count, 1)
+            self.assertFalse(sleep.called)
+            with self.assertRaises(bot.SheetsBusy) as pending:
+                bot._google_request('GET', 'https://sheets.googleapis.com/v4/spreadsheets/records', timeout=15)
+            self.assertGreaterEqual(pending.exception.retry_after, 89)
+            self.assertEqual(request.call_count, 1)
+
+    def test_local_quota_defers_foreground_but_reserves_write_bucket(self):
+        gate = bot.QuotaGate(limit=2)
+        gate.take('read'); gate.take('read')
+        with self.assertRaises(bot.SheetsBusy):
+            gate.take('read')
+        gate.take('write')
+
+    def test_narrow_index_scans_5000_rows_without_loading_payloads(self):
+        event = bot.MessageEvent.new_from_json_dict(self.event(ORDER))
+        bot.reliable_orders.receive(event)
+        header, row = db.tabs['訂單收件匣']['rows']
+        db.tabs['訂單收件匣']['rows'] = [header] + [[] for _ in range(9998)] + [row]
+        bot._sheet_metadata_cache.clear()
+        original = db.request
+        ranges_seen = []
+        def count(*args, **kwargs):
+            if 'values:batchGet' in args[1]:
+                ranges_seen.append(kwargs['params']['ranges'])
+            return original(*args, **kwargs)
+        with patch.object(db, 'request', side_effect=count):
+            bot.reliable_orders.refresh()
+        self.assertEqual(len(ranges_seen), 2)
+        self.assertTrue(all(all('!A' in r or '!C' in r for r in ranges) for ranges in ranges_seen))
+        self.assertEqual(bot.reliable_orders.index['e1']['row'], 10000)
+
+    def test_successful_reinitialization_enables_order_receipt(self):
+        bot._storage_state.update(ready=False, initializing=True)
+        bot._initialize_storage()
+        self.assertEqual(self.client.get('/ready').status_code, 200)
+        self.assertEqual(self.send().status_code, 200)
+        self.assertEqual(self.status(), 'DONE')
 
 
 if __name__ == '__main__':

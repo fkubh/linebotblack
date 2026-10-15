@@ -1,6 +1,9 @@
 import os
 import sys
 import hmac
+import threading
+import random
+from sheets_runtime import QuotaGate, SheetsBusy
 from reliable_orders import ReliableOrders
 import re
 import json
@@ -43,6 +46,11 @@ from linebot.models import (
 
 app = Flask(__name__)
 _order_write_batch = None
+_sheets_gate = QuotaGate()
+_sheet_metadata_cache = {}
+_storage_lock = threading.Lock()
+_storage_state = {"ready": False, "initializing": False, "last_error": None, "next_retry": 0.0}
+reliable_orders = None
 _reliable_skip_capture = False
 REPLAY_SECRET = os.environ.get("REPLAY_SECRET", "")
 if len(REPLAY_SECRET) < 32:
@@ -440,36 +448,45 @@ def _taipei_now_iso():
 
 
 def _google_request(method, url, *, operation="Google API", retry=True, **kwargs):
-    """Google API request with bounded retry for 429/5xx/network failures."""
+    """Guard Sheets quotas; never blindly retry non-idempotent order batches."""
     attempts = GOOGLE_SHEET_RETRY_ATTEMPTS if retry else 1
-    last_exc = None
+    kind = "read" if method.upper() == "GET" else "write"
+    background = threading.current_thread().name == "sheet-bootstrap"
     for attempt in range(1, attempts + 1):
+        _sheets_gate.take(kind, background=background)
         try:
             response = requests.request(method, url, **kwargs)
-            if response.status_code < 400:
-                return response
-            if response.status_code == 429 or response.status_code >= 500:
-                app.logger.warning(
-                    "[SHEET RETRY] op=%s attempt=%s/%s status=%s body=%s",
-                    operation, attempt, attempts, response.status_code, response.text[:300],
-                )
-                if attempt < attempts:
-                    time.sleep(GOOGLE_SHEET_RETRY_BASE_SECONDS * attempt)
+            if method.upper() != "GET":
+                match = re.search(r"/spreadsheets/([^/:?]+)", url)
+                if match:
+                    _sheet_metadata_cache.pop(match[1], None)
+            if response.status_code == 429:
+                raw_wait = response.headers.get("Retry-After", "60")
+                try:
+                    wait = max(60.0, float(raw_wait))
+                except (TypeError, ValueError):
+                    wait = 60.0
+                _sheets_gate.block(kind, wait)
+                app.logger.warning("[SHEETS QUOTA] op=%s cooldown_seconds=%.0f", operation, wait)
+                if background and retry and attempt < attempts:
                     continue
-            response.raise_for_status()
-        except (requests.Timeout, requests.ConnectionError) as exc:
-            last_exc = exc
-            app.logger.warning(
-                "[SHEET RETRY] op=%s attempt=%s/%s error=%r",
-                operation, attempt, attempts, exc,
-            )
-            if attempt < attempts:
-                time.sleep(GOOGLE_SHEET_RETRY_BASE_SECONDS * attempt)
+                response.raise_for_status()
+            if response.status_code >= 500 and attempt < attempts:
+                time.sleep(min(10.0, GOOGLE_SHEET_RETRY_BASE_SECONDS * (2 ** (attempt - 1))) + random.random())
                 continue
-            raise
-    if last_exc:
-        raise last_exc
-    raise RuntimeError(f"{operation} failed after {attempts} attempts")
+            response.raise_for_status()
+            return response
+        except (requests.Timeout, requests.ConnectionError):
+            # A mutation may have committed despite a missing response. Quota
+            # metadata must not survive that uncertain write either.
+            if method.upper() != "GET":
+                match = re.search(r"/spreadsheets/([^/:?]+)", url)
+                if match:
+                    _sheet_metadata_cache.pop(match[1], None)
+            if attempt >= attempts:
+                raise
+            time.sleep(min(10.0, GOOGLE_SHEET_RETRY_BASE_SECONDS * (2 ** (attempt - 1))) + random.random())
+    raise RuntimeError(f"{operation} failed")
 
 
 def _sheet_values(spreadsheet_id, range_name):
@@ -507,8 +524,9 @@ def _sheet_rows(spreadsheet_id, tab_name, first_col, last_col, start_row=2,
     if row_count is None:
         raise RuntimeError(f"Missing grid rowCount for: {tab_name}")
     escaped_tab = tab_name.replace("'", "''")
-    for first in range(start_row, row_count + 1, 500):
-        last = min(first + 499, row_count)
+    page_size = 5000 if selected_columns else 500
+    for first in range(start_row, row_count + 1, page_size):
+        last = min(first + page_size - 1, row_count)
         if selected_columns:
             # Dedupe needs only event ID and status, never raw message text.
             ranges = [f"'{escaped_tab}'!{col}{first}:{col}{last}"
@@ -542,10 +560,14 @@ def _google_headers():
 
 
 def _sheet_metadata(spreadsheet_id):
+    cached = _sheet_metadata_cache.get(spreadsheet_id)
+    if cached and time.monotonic() - cached[0] < 300:
+        return cached[1]
     url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}?fields=sheets.properties"
     response = _google_request("GET", url, headers=_google_headers(), timeout=15, operation="SHEET METADATA")
-    response.raise_for_status()
-    return response.json()
+    metadata = response.json()
+    _sheet_metadata_cache[spreadsheet_id] = (time.monotonic(), metadata)
+    return metadata
 
 
 def _ensure_sheet_tab(spreadsheet_id, tab_name, headers):
@@ -575,6 +597,8 @@ def _ensure_sheet_tab(spreadsheet_id, tab_name, headers):
             timeout=15, operation=f"WRITE HEADER {tab_name}",
         )
         response.raise_for_status()
+
+    return existing or [headers]
 
 
 def _sheet_append(spreadsheet_id, tab_name, values):
@@ -1441,11 +1465,8 @@ def load_driver_lists(force=False):
         "Authorization": f"Bearer {GOOGLE_CREDENTIALS.token}"
     }
 
-    response = requests.get(
-        url,
-        headers=headers,
-        timeout=10
-    )
+    response = _google_request("GET", url, headers=headers, timeout=10,
+                               operation="READ driver lists")
 
     if response.status_code != 200:
         app.logger.error(
@@ -1941,15 +1962,62 @@ def _log_boot_memory(stage):
         pass  # resource is unavailable on Windows.
 
 
-_log_boot_memory("before-sheet-init")
-_init_google_sheet_persistence()
-_log_boot_memory("after-sheet-init")
-reliable_orders = ReliableOrders(sys.modules[__name__], BOT_INBOX_TAB)
+def _initialize_storage():
+    global reliable_orders
+    try:
+        _log_boot_memory("before-sheet-init")
+        app.logger.warning("[STORAGE INIT] loading order history")
+        _init_google_sheet_persistence()
+        app.logger.warning("[STORAGE INIT] loading inbox index")
+        inbox = ReliableOrders(sys.modules[__name__], BOT_INBOX_TAB)
+        reliable_orders = inbox
+        with _storage_lock:
+            _storage_state.update(ready=True, last_error=None, next_retry=0.0)
+        _log_boot_memory("after-sheet-init")
+        app.logger.warning("[STORAGE READY] orders and inbox ready")
+    except Exception as exc:
+        with _storage_lock:
+            _storage_state.update(ready=False, last_error=type(exc).__name__, next_retry=time.monotonic() + 60)
+        app.logger.exception("[STORAGE NOT READY] retry after cooldown; webhook remains unacknowledged")
+    finally:
+        with _storage_lock:
+            _storage_state["initializing"] = False
+
+
+def _start_storage_init():
+    with _storage_lock:
+        if _storage_state["ready"] or _storage_state["initializing"]:
+            return
+        if time.monotonic() < _storage_state["next_retry"]:
+            return
+        _storage_state["initializing"] = True
+        thread = threading.Thread(target=_initialize_storage, name="sheet-bootstrap", daemon=True)
+        try:
+            thread.start()
+        except Exception:
+            _storage_state["initializing"] = False
+            raise
+
+
+def _storage_available():
+    if not _storage_state["ready"]:
+        _start_storage_init()
+    return _storage_state["ready"]
 
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return f"LINE bot is running | reliable-inbox-v1 | order parser {PARSER_VERSION}", 200
+    ready = _storage_available()
+    state = "ready" if ready else "NOT_READY"
+    # Liveness only. Readiness and order acknowledgements are separate.
+    return f"LINE bot web is running | reliable-inbox-v1.1-startup | storage={state} | order parser {PARSER_VERSION}", 200
+
+
+@app.route("/ready", methods=["GET"])
+def storage_readiness():
+    ready = _storage_available()
+    return {"ready": ready, "initializing": _storage_state["initializing"],
+            "last_error_type": _storage_state["last_error"]}, 200 if ready else 503
 
 
 # =====================================================
@@ -1978,11 +2046,17 @@ def callback():
     # LINE 驗證 / 同步處理：只有全部 handler 完成才回 200。
     # 若 Google Sheet 寫入失敗，讓 request 回 500，避免錯誤被吃掉後仍回 200。
     try:
+        # Verify before doing initialization work. An empty LINE verification
+        # contains no orders; real messages must wait for durable storage.
+        events = handler.parser.parse(body, signature)
+        if not events:
+            return "OK", 200
+        if not _storage_available():
+            return "STORAGE_NOT_READY", 503, {"Retry-After": "60"}
+        handler.handle(body, signature)
 
-        handler.handle(
-            body,
-            signature
-        )
+    except SheetsBusy as exc:
+        return "SHEETS_BUSY", 503, {"Retry-After": str(exc.retry_after)}
 
     except InvalidSignatureError:
 
@@ -2104,7 +2178,7 @@ def _handle_message_business(event):
         try:
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text=f"訂單解析器：{PARSER_VERSION}\n訂單保護：reliable-inbox-v1")
+                TextSendMessage(text=f"訂單解析器：{PARSER_VERSION}\n訂單保護：reliable-inbox-v1.1-startup")
             )
         except LineBotApiError as exc:
             if "Invalid reply token" in str(exc):
@@ -2361,6 +2435,8 @@ def replay_orders():
     auth = request.headers.get("Authorization", "")
     if not hmac.compare_digest(auth.encode('utf-8'), ("Bearer " + REPLAY_SECRET).encode('utf-8')):
         abort(403)
+    if not _storage_available():
+        return {"error": "storage_not_ready"}, 503, {"Retry-After": "60"}
     try:
         reliable_orders.drain(limit=3, budget=25, refresh=True)
         return reliable_orders.report(), 200
@@ -2416,6 +2492,9 @@ def handle_other_message(event):
 # =====================================================
 # 啟動 Flask
 # =====================================================
+
+_start_storage_init()
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))

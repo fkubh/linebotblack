@@ -32,10 +32,8 @@ class ReliableOrders:
         self.refresh_needed = True
         self.last_run = None
         self.last_error = ''
-        bot._ensure_sheet_tab(bot.BOT_RECORD_SHEET_ID, tab, HEADERS)
-        escaped = tab.replace("'", "''")
-        header = bot._sheet_values(bot.BOT_RECORD_SHEET_ID, f"'{escaped}'!A1:H1")
-        if not header or header[0] != HEADERS:
+        header = bot._ensure_sheet_tab(bot.BOT_RECORD_SHEET_ID, tab, HEADERS)
+        if not header or header[0][:len(HEADERS)] != HEADERS:
             raise RuntimeError('Inbox header mismatch; use a new, dedicated inbox tab')
         self.refresh()
 
@@ -47,8 +45,8 @@ class ReliableOrders:
         escaped = self.tab.replace("'", "''")
         index = {}
         # Read IDs/statuses only; load each payload only when actually processing.
-        for start in range(2, props['gridProperties']['rowCount'] + 1, 500):
-            end = min(start + 499, props['gridProperties']['rowCount'])
+        for start in range(2, props['gridProperties']['rowCount'] + 1, 5000):
+            end = min(start + 4999, props['gridProperties']['rowCount'])
             response = b._google_request(
                 'GET', f'https://sheets.googleapis.com/v4/spreadsheets/{b.BOT_RECORD_SHEET_ID}/values:batchGet',
                 headers=b._google_headers(), timeout=15,
@@ -229,7 +227,7 @@ class ReliableOrders:
         counts = {}
         for item in self.index.values():
             counts[item['status']] = counts.get(item['status'], 0) + 1
-        return {'version': 'reliable-inbox-v1', 'counts': counts,
+        return {'version': 'reliable-inbox-v1.1-startup', 'counts': counts,
                 'pending': sum(v for k, v in counts.items() if k not in FINAL),
                 'last_replay': self.last_run, 'last_error_type': self.last_error,
                 'review_event_ids': [eid for eid, item in self.index.items() if item['status'] == 'REVIEW'][:20]}
