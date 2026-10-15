@@ -2,10 +2,22 @@ services:
   - type: web
     name: linebotblack
     runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn lineborblack_cloud:app
+    plan: free
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: gunicorn --config gunicorn.conf.py lineborblack_cloud:app
+    healthCheckPath: /
     envVars:
+      - key: WEB_CONCURRENCY
+        value: "1"
       - key: CHANNEL_ACCESS_TOKEN
         sync: false
       - key: CHANNEL_SECRET
+        sync: false
+      - key: GOOGLE_SHEET_ID
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: BOT_RECORD_SHEET_ID
+        sync: false
+      - key: ORDER_SHEET_ID
         sync: false

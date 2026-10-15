@@ -1,5 +1,7 @@
-Flask
-line-bot-sdk
-gunicorn
-google-auth
-requests
+Flask==3.1.2
+# Keep the existing v2-compatible API on a pinned current SDK release.
+line-bot-sdk==3.26.0
+gunicorn==23.0.0
+google-auth==2.40.3
+requests==2.32.5
+tzdata==2025.2

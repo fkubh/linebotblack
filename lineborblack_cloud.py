@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
+from itertools import zip_longest
 
 from order_summary_v1 import (
     Event, EventStore, LineOrderStore, generate_daily_summary, generate_unassigned_summary, parse_line_command, parse_rows, parse_line_order_text, merge_sheet_and_line_orders, orders_core_equal, extract_driver_info, detect_line_event_alias, PARSER_VERSION
@@ -476,6 +477,48 @@ def _sheet_values(spreadsheet_id, range_name):
 
 
 
+
+def _sheet_rows(spreadsheet_id, tab_name, first_col, last_col, start_row=2,
+                selected_columns=None):
+    """Read all populated rows in fixed pages, including gaps; never truncate history.
+
+    Sheets omits trailing empty rows in each response. Only grid rowCount is a
+    safe termination condition because a later page can contain more records.
+    """
+    titles = _sheet_metadata(spreadsheet_id).get("sheets", [])
+    props = next((s["properties"] for s in titles
+                  if s.get("properties", {}).get("title") == tab_name), None)
+    if props is None:
+        raise RuntimeError(f"Google Sheet tab not found: {tab_name}")
+    row_count = props.get("gridProperties", {}).get("rowCount")
+    if row_count is None:
+        raise RuntimeError(f"Missing grid rowCount for: {tab_name}")
+    escaped_tab = tab_name.replace("'", "''")
+    for first in range(start_row, row_count + 1, 500):
+        last = min(first + 499, row_count)
+        if selected_columns:
+            # Dedupe needs only event ID and status, never raw message text.
+            ranges = [f"'{escaped_tab}'!{col}{first}:{col}{last}"
+                      for col in selected_columns]
+            url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values:batchGet"
+            response = _google_request(
+                "GET", url, headers=_google_headers(), timeout=15,
+                params={"ranges": ranges, "fields": "valueRanges(values)"},
+                operation="READ selected history columns",
+            )
+            columns = response.json().get("valueRanges", [])
+            if len(columns) != len(selected_columns):
+                raise RuntimeError("Unexpected Google Sheets batchGet response")
+            yield from zip_longest(
+                *([r[0] if r else "" for r in col.get("values", [])]
+                  for col in columns), fillvalue=""
+            )
+            continue
+        yield from _sheet_values(
+            spreadsheet_id, f"'{escaped_tab}'!{first_col}{first}:{last_col}{last}"
+        )
+
+
 def _google_headers():
     if not GOOGLE_CREDENTIALS.valid:
         GOOGLE_CREDENTIALS.refresh(GoogleAuthRequest())
@@ -609,12 +652,12 @@ def _load_processed_webhook_event_ids():
         _processed_webhook_event_ids = set()
         return
     try:
-        rows = _sheet_values(BOT_RECORD_SHEET_ID, f"'{BOT_RAW_EVENT_TAB}'!A2:J")
+        rows = _sheet_rows(BOT_RECORD_SHEET_ID, BOT_RAW_EVENT_TAB, "B", "I",
+                           selected_columns=("B", "I"))
         done = set()
         for row in rows:
-            row = list(row) + [""] * (10 - len(row))
-            event_id = str(row[1] or "").strip()
-            status = str(row[8] or "").strip().upper()
+            event_id = str(row[0] or "").strip()
+            status = str(row[1] or "").strip().upper()
             if event_id and status == "PROCESSED":
                 done.add(event_id)
         _processed_webhook_event_ids = done
@@ -647,7 +690,7 @@ class GoogleSheetEventStore:
         self._events_by_order = index
 
     def load(self):
-        rows = _sheet_values(self.spreadsheet_id, f"'{self.tab_name}'!A2:H")
+        rows = _sheet_rows(self.spreadsheet_id, self.tab_name, "A", "H")
         events = []
         for row in rows:
             row = list(row) + [""] * (8 - len(row))
@@ -734,7 +777,7 @@ class GoogleSheetLineOrderStore:
         self.load()
 
     def load(self):
-        rows = _sheet_values(self.spreadsheet_id, f"'{self.tab_name}'!A2:D")
+        rows = _sheet_rows(self.spreadsheet_id, self.tab_name, "A", "D")
         records = {}
         from order_summary_v1 import Order, LineOrderRecord
         for row in rows:
@@ -784,18 +827,20 @@ class GoogleSheetLineOrderStore:
         app.logger.info("[ORDER OK] order_id=%s mode=%s", order.order_id, mode)
 
     def cleanup_older_than(self, cutoff):
-        rows = _sheet_values(self.spreadsheet_id, f"'{self.tab_name}'!A2:D")
+        rows = _sheet_rows(self.spreadsheet_id, self.tab_name, "A", "D")
         kept_rows = []
+        total_rows = 0
         for row in rows:
+            total_rows += 1
             row = list(row) + [""] * (4 - len(row))
             dt = _parse_record_time(row[1])
             if dt is None or dt >= cutoff:
                 kept_rows.append(row[:4])
-        if len(kept_rows) == len(rows):
+        if len(kept_rows) == total_rows:
             return 0
         _sheet_clear(self.spreadsheet_id, f"'{self.tab_name}'!A2:D")
         _sheet_write_rows(self.spreadsheet_id, f"'{self.tab_name}'!A2", kept_rows)
-        removed = len(rows) - len(kept_rows)
+        removed = total_rows - len(kept_rows)
         self.load()
         return removed
 
@@ -1876,7 +1921,20 @@ def check_account(text):
 # =====================================================
 
 # V1.6.9：在開始接收 LINE webhook 前，先從永久 Google Sheet 載入歷史狀態。
+def _log_boot_memory(stage):
+    """Linux peak RSS diagnostics; no extra dependency or background process."""
+    try:
+        import resource
+        peak_mib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        app.logger.warning("[BOOT MEMORY] stage=%s pid=%s peak_rss_mib=%.1f",
+                           stage, os.getpid(), peak_mib)
+    except ImportError:
+        pass  # resource is unavailable on Windows.
+
+
+_log_boot_memory("before-sheet-init")
 _init_google_sheet_persistence()
+_log_boot_memory("after-sheet-init")
 
 
 @app.route("/", methods=["GET"])
