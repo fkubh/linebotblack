@@ -1,0 +1,2542 @@
+import os
+import sys
+import hmac
+import threading
+import random
+from sheets_runtime import QuotaGate, SheetsBusy
+from reliable_orders import ReliableOrders
+import re
+import json
+import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from urllib.parse import quote
+from itertools import zip_longest
+
+from order_summary_v1 import (
+    Event, EventStore, LineOrderStore, generate_daily_summary, generate_unassigned_summary, parse_line_command, parse_rows, parse_line_order_text, merge_sheet_and_line_orders, orders_core_equal, extract_driver_info, detect_line_event_alias, PARSER_VERSION
+)
+
+from google.oauth2 import service_account
+from google.auth.transport.requests import Request as GoogleAuthRequest
+import requests
+
+from flask import Flask, request, abort
+
+from linebot import (
+    LineBotApi,
+    WebhookHandler
+)
+
+from linebot.exceptions import (
+    InvalidSignatureError,
+    LineBotApiError,
+)
+
+from linebot.models import (
+    MessageEvent,
+    TextMessage,
+    TextSendMessage,
+)
+
+
+# =====================================================
+# Flask
+# =====================================================
+
+app = Flask(__name__)
+_order_write_batch = None
+_sheets_gate = QuotaGate()
+_sheet_metadata_cache = {}
+_storage_pid = os.getpid()
+_storage_lock = threading.Lock()
+_storage_state = {"ready": False, "initializing": False, "last_error": None, "next_retry": 0.0, "started_at": None, "operation": "idle", "progress_at": None}
+reliable_orders = None
+_reliable_skip_capture = False
+REPLAY_SECRET = os.environ.get("REPLAY_SECRET", "")
+if len(REPLAY_SECRET) < 32:
+    raise RuntimeError("請設定至少 32 字元的隨機 REPLAY_SECRET，供安全補處理使用")
+BOT_INBOX_TAB = os.environ.get("BOT_INBOX_TAB", "訂單收件匣").strip() or "訂單收件匣"
+
+
+
+# =====================================================
+# LINE Bot 設定
+# =====================================================
+
+CHANNEL_ACCESS_TOKEN = os.environ.get("CHANNEL_ACCESS_TOKEN")
+
+CHANNEL_SECRET = os.environ.get("CHANNEL_SECRET")
+
+
+if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
+    raise RuntimeError(
+        "缺少 LINE 環境變數：請設定 CHANNEL_ACCESS_TOKEN 與 CHANNEL_SECRET"
+    )
+
+
+line_bot_api = LineBotApi(
+    CHANNEL_ACCESS_TOKEN
+)
+
+handler = WebhookHandler(
+    CHANNEL_SECRET
+)
+
+# =====================================================
+# Google Sheet 司機資料
+# =====================================================
+
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+GOOGLE_SHEET_TAB = os.environ.get("GOOGLE_SHEET_TAB", "drivers")
+
+if not GOOGLE_SHEET_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
+    raise RuntimeError(
+        "缺少 Google Sheet 環境變數：請設定 GOOGLE_SHEET_ID 與 GOOGLE_SERVICE_ACCOUNT_JSON"
+    )
+
+try:
+    GOOGLE_SERVICE_ACCOUNT_INFO = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+except json.JSONDecodeError as exc:
+    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON 不是有效的 JSON") from exc
+
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+GOOGLE_CREDENTIALS = service_account.Credentials.from_service_account_info(
+    GOOGLE_SERVICE_ACCOUNT_INFO,
+    scopes=GOOGLE_SCOPES,
+)
+
+# =====================================================
+# 訂單每日簡表 V1
+# =====================================================
+# 訂單可使用另一份 Google Sheet；若未設定則停用簡表功能，不影響原本司機黑名單功能。
+ORDER_SHEET_ID = os.environ.get("ORDER_SHEET_ID", "").strip()
+ORDER_EVENTS_PATH = os.environ.get("ORDER_EVENTS_PATH", "order_events_v1.json")
+ORDER_LINE_ORDERS_PATH = os.environ.get("ORDER_LINE_ORDERS_PATH", "line_orders_v1.json")
+ORDER_SHEET_MAX_COL = os.environ.get("ORDER_SHEET_MAX_COL", "H")
+ORDER_SHEET_TAB_TEMPLATE = os.environ.get("ORDER_SHEET_TAB_TEMPLATE", "{year}/{month}月")
+ORDER_SHOW_UNASSIGNED = os.environ.get("ORDER_SHOW_UNASSIGNED", "false").lower() in {"1", "true", "yes", "on"}
+
+# V1.6.9：Render Free 沒有 Persistent Disk，因此把訂單狀態永久存到獨立 Google Sheet。
+# 可在 Render 用 BOT_RECORD_SHEET_ID 覆蓋；未設定時使用目前指定的 Bot 紀錄表。
+BOT_RECORD_SHEET_ID = os.environ.get(
+    "BOT_RECORD_SHEET_ID",
+    "1upIa52zC6J_UEDz700Lv2F-hlbgU_x7p-ZZfVfCND5M",
+).strip()
+BOT_EVENT_TAB = os.environ.get("BOT_EVENT_TAB", "訂單事件").strip() or "訂單事件"
+BOT_LINE_ORDER_TAB = os.environ.get("BOT_LINE_ORDER_TAB", "LINE訂單").strip() or "LINE訂單"
+
+# V1.6.16：Webhook / Google Sheet 漏單追蹤。
+BOT_RAW_EVENT_TAB = os.environ.get("BOT_RAW_EVENT_TAB", "LINE原始事件").strip() or "LINE原始事件"
+BOT_RAW_EVENT_LOG_ENABLED = os.environ.get("BOT_RAW_EVENT_LOG_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+GOOGLE_SHEET_RETRY_ATTEMPTS = max(1, int(os.environ.get("GOOGLE_SHEET_RETRY_ATTEMPTS", "3")))
+GOOGLE_SHEET_RETRY_BASE_SECONDS = max(0.2, float(os.environ.get("GOOGLE_SHEET_RETRY_BASE_SECONDS", "1.0")))
+
+# V1.6.10：只有包車群＋測試群可寫入 LINE 訂單／調度狀態。
+# 先部署後在兩群輸入「群組ID」取得 ID，再填入 Render 環境變數。
+PACKAGE_GROUP_ID = os.environ.get("PACKAGE_GROUP_ID", "Cbec1868a3b62f4210cb9ade284cd8409").strip()
+TEST_GROUP_ID = os.environ.get("TEST_GROUP_ID", "C89a73c61413eaa4d761ae9e2e11cf96f").strip()
+BOT_RECORD_RETENTION_DAYS = int(os.environ.get("BOT_RECORD_RETENTION_DAYS", "60"))
+_cleanup_state = {"last_run": None}
+_processed_webhook_event_ids = set()
+
+# V1.6.3 簡表密碼與管理員權限
+# 使用方式：簡表 9/2 9353、未派 9/2 9353
+SUMMARY_ACCESS_CODE = os.environ.get("SUMMARY_ACCESS_CODE", "9353").strip()
+SUMMARY_PRIVATE_ONLY = False  # V1.6.5：簡表允許群組與私訊，僅以密碼控管
+
+# 只有這個 LINE User ID 可以查詢「誰曾經私訊過 Bot」。
+# 請先私訊 Bot 輸入「我的ID」，再把取得的 U... 填到 Render：
+# SUMMARY_ADMIN_USER_ID=Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+SUMMARY_ADMIN_USER_ID = os.environ.get("SUMMARY_ADMIN_USER_ID", "").strip()
+BOT_INTERACTIONS_PATH = os.environ.get("BOT_INTERACTIONS_PATH", "bot_interactions_v1.json")
+BOT_USAGE_PATH = os.environ.get("BOT_USAGE_PATH", "bot_usage_v1.json")
+# 啟動初期先建立相容物件；V1.6.9 在 Google Sheet helper 定義完成後
+# 會用永久 Google Sheet Store 取代。
+order_event_store = EventStore(ORDER_EVENTS_PATH)
+line_order_store = LineOrderStore(ORDER_LINE_ORDERS_PATH)
+
+
+
+def _line_user_id(event):
+    source = getattr(event, "source", None)
+    return (getattr(source, "user_id", "") or "").strip() if source else ""
+
+
+def _line_source_type(event):
+    source = getattr(event, "source", None)
+    if source is None:
+        return ""
+    source_type = (getattr(source, "type", "") or "").strip().lower()
+    if source_type:
+        return source_type
+    if getattr(source, "group_id", ""):
+        return "group"
+    if getattr(source, "room_id", ""):
+        return "room"
+    if getattr(source, "user_id", ""):
+        return "user"
+    return ""
+
+
+def _line_group_id(event):
+    source = getattr(event, "source", None)
+    return (getattr(source, "group_id", "") or "").strip() if source else ""
+
+
+def _authorized_order_group_ids():
+    return {gid for gid in (PACKAGE_GROUP_ID, TEST_GROUP_ID) if gid}
+
+
+def _line_event_id(event):
+    """LINE webhook_event_id；舊版 SDK/測試事件沒有時回空字串。"""
+    return str(getattr(event, "webhook_event_id", "") or "").strip()
+
+
+def _line_is_redelivery(event):
+    ctx = getattr(event, "delivery_context", None)
+    return bool(getattr(ctx, "is_redelivery", False)) if ctx is not None else False
+
+
+def _is_authorized_order_source(event):
+    """V1.6.10：LINE 訂單/派車狀態只接受包車群與測試群。"""
+    if _line_source_type(event) != "group":
+        return False
+    gid = _line_group_id(event)
+    allowed = _authorized_order_group_ids()
+    # 尚未填 Group ID 時先進入設定模式：不寫訂單，避免誤收其他群資料。
+    return bool(allowed and gid in allowed)
+
+
+def _is_private_line_chat(event):
+    return _line_source_type(event) == "user"
+
+
+def _summary_password_ok(text: str) -> bool:
+    if not SUMMARY_ACCESS_CODE:
+        return False
+    parts = (text or "").strip().split()
+    return bool(parts) and parts[-1] == SUMMARY_ACCESS_CODE
+
+
+def _strip_summary_password(text: str) -> str:
+    parts = (text or "").strip().split()
+    if parts and parts[-1] == SUMMARY_ACCESS_CODE:
+        return " ".join(parts[:-1]).strip()
+    return (text or "").strip()
+
+
+def _my_line_identity_text(event):
+    user_id = _line_user_id(event)
+    if not user_id:
+        return "目前無法取得你的 LINE User ID。"
+
+    display_name = ""
+    try:
+        profile = line_bot_api.get_profile(user_id)
+        display_name = getattr(profile, "display_name", "") or ""
+    except Exception as exc:
+        app.logger.info("取得 LINE Profile 失敗：%s", exc)
+
+    source_type = _line_source_type(event)
+    source_text = {
+        "user": "私訊",
+        "group": "群組",
+        "room": "聊天室",
+    }.get(source_type, source_type or "未知")
+
+    lines = ["你的 LINE 資料："]
+    if display_name:
+        lines.append(f"顯示名稱：{display_name}")
+    lines.append(f"User ID：{user_id}")
+    lines.append(f"目前來源：{source_text}")
+    lines.append("")
+    if SUMMARY_ADMIN_USER_ID and user_id == SUMMARY_ADMIN_USER_ID:
+        lines.append("管理員權限：✅")
+    else:
+        lines.append("管理員權限：❌")
+    return "\n".join(lines)
+
+
+def _load_interactions():
+    try:
+        with open(BOT_INTERACTIONS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_interactions(data):
+    try:
+        tmp = BOT_INTERACTIONS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, BOT_INTERACTIONS_PATH)
+    except Exception as exc:
+        app.logger.warning("互動紀錄儲存失敗：%s", exc)
+
+
+def _display_name_for_event(event):
+    user_id = _line_user_id(event)
+    if not user_id:
+        return ""
+
+    source = getattr(event, "source", None)
+    source_type = _line_source_type(event)
+
+    try:
+        if source_type == "group":
+            group_id = getattr(source, "group_id", "") or ""
+            if group_id and hasattr(line_bot_api, "get_group_member_profile"):
+                profile = line_bot_api.get_group_member_profile(group_id, user_id)
+                return getattr(profile, "display_name", "") or ""
+        if source_type == "room":
+            room_id = getattr(source, "room_id", "") or ""
+            if room_id and hasattr(line_bot_api, "get_room_member_profile"):
+                profile = line_bot_api.get_room_member_profile(room_id, user_id)
+                return getattr(profile, "display_name", "") or ""
+
+        profile = line_bot_api.get_profile(user_id)
+        return getattr(profile, "display_name", "") or ""
+    except Exception:
+        return ""
+
+
+def _load_usage():
+    try:
+        with open(BOT_USAGE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_usage(data):
+    try:
+        data = list(data)[-500:]
+        tmp = BOT_USAGE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, BOT_USAGE_PATH)
+    except Exception as exc:
+        app.logger.warning("Bot 使用紀錄儲存失敗：%s", exc)
+
+
+def _record_bot_usage(event, action, result="成功"):
+    if _order_write_batch is not None:
+        return  # Order replay must not call LINE profiles or write local usage files.
+
+    """只記誰、何時、在哪裡觸發了哪個 Bot 功能；不保存原始訊息內容或密碼。"""
+    user_id = _line_user_id(event)
+    if not user_id:
+        return
+
+    source = getattr(event, "source", None)
+    source_type = _line_source_type(event)
+
+    item = {
+        "at": _taipei_now_iso(),
+        "user_id": user_id,
+        "display_name": _display_name_for_event(event),
+        "source": source_type or "unknown",
+        "action": action,
+        "result": result,
+    }
+
+    if source_type == "group":
+        item["source_id"] = getattr(source, "group_id", "") or ""
+    elif source_type == "room":
+        item["source_id"] = getattr(source, "room_id", "") or ""
+
+    data = _load_usage()
+    data.append(item)
+    _save_usage(data)
+
+
+def _usage_report(event):
+    user_id = _line_user_id(event)
+
+    if not SUMMARY_ADMIN_USER_ID or user_id != SUMMARY_ADMIN_USER_ID:
+        return "無權限使用此功能。"
+
+    if not _is_private_line_chat(event):
+        return "使用紀錄屬機密資料，請私訊 Bot 查詢。"
+
+    data = _load_usage()
+    if not data:
+        return "目前還沒有 Bot 使用紀錄。"
+
+    lines = [f"Bot 使用紀錄（最近 {min(len(data), 50)} 筆）："]
+
+    for item in reversed(data[-50:]):
+        source = item.get("source") or "unknown"
+        source_text = {
+            "user": "私訊",
+            "group": "群組",
+            "room": "聊天室",
+        }.get(source, source)
+
+        name = item.get("display_name") or "未取得名稱"
+        uid = item.get("user_id") or ""
+        at = item.get("at") or ""
+        action = item.get("action") or "未知功能"
+        result = item.get("result") or ""
+
+        lines.append("")
+        lines.append(f"{at}｜{source_text}")
+        lines.append(f"{name}｜{uid}")
+        lines.append(f"觸發：{action}｜{result}")
+
+    return "\n".join(lines)
+
+
+def _record_private_interaction(event):
+    """只記錄誰私訊過 Bot，不保存使用者訊息內容。"""
+    if not _is_private_line_chat(event):
+        return
+    user_id = _line_user_id(event)
+    if not user_id:
+        return
+
+    display_name = _display_name_for_event(event)
+
+    data = _load_interactions()
+    item = data.get(user_id, {})
+    item["user_id"] = user_id
+    if display_name:
+        item["display_name"] = display_name
+    item["last_seen"] = _taipei_now_iso()
+    item["count"] = int(item.get("count", 0) or 0) + 1
+    data[user_id] = item
+    _save_interactions(data)
+
+
+def _interaction_report(event):
+    user_id = _line_user_id(event)
+    if not SUMMARY_ADMIN_USER_ID or user_id != SUMMARY_ADMIN_USER_ID:
+        return "無權限使用此功能。"
+
+    data = _load_interactions()
+    if not data:
+        return "目前還沒有私訊紀錄。"
+
+    items = sorted(
+        data.values(),
+        key=lambda x: x.get("last_seen", ""),
+        reverse=True
+    )
+
+    lines = [f"私訊 Bot 的使用者（共 {len(items)} 人）："]
+    for item in items[:50]:
+        name = item.get("display_name") or "未取得名稱"
+        uid = item.get("user_id") or ""
+        last_seen = item.get("last_seen") or ""
+        count = item.get("count", 0)
+        lines.append("")
+        lines.append(name)
+        lines.append(f"User ID：{uid}")
+        lines.append(f"最後私訊：{last_seen}")
+        lines.append(f"互動次數：{count}")
+    if len(items) > 50:
+        lines.append("")
+        lines.append(f"另有 {len(items) - 50} 人未顯示。")
+    return "\n".join(lines)
+
+def _taipei_now_iso():
+    return datetime.now(ZoneInfo("Asia/Taipei")).isoformat(timespec="minutes")
+
+
+def _google_request(method, url, *, operation="Google API", retry=True, **kwargs):
+    """Guard Sheets quotas; never blindly retry non-idempotent order batches."""
+    if threading.current_thread().name == "sheet-bootstrap":
+        with _storage_lock:
+            _storage_state.update(operation=operation, progress_at=time.monotonic())
+        app.logger.warning("[STORAGE PROGRESS] pid=%s op=%s", os.getpid(), operation)
+    attempts = GOOGLE_SHEET_RETRY_ATTEMPTS if retry else 1
+    kind = "read" if method.upper() == "GET" else "write"
+    background = threading.current_thread().name == "sheet-bootstrap"
+    for attempt in range(1, attempts + 1):
+        _sheets_gate.take(kind, background=background)
+        try:
+            response = requests.request(method, url, **kwargs)
+            if method.upper() != "GET":
+                match = re.search(r"/spreadsheets/([^/:?]+)", url)
+                if match:
+                    _sheet_metadata_cache.pop(match[1], None)
+            if response.status_code == 429:
+                raw_wait = response.headers.get("Retry-After", "60")
+                try:
+                    wait = max(60.0, float(raw_wait))
+                except (TypeError, ValueError):
+                    wait = 60.0
+                _sheets_gate.block(kind, wait)
+                app.logger.warning("[SHEETS QUOTA] op=%s cooldown_seconds=%.0f", operation, wait)
+                if background and retry and attempt < attempts:
+                    continue
+                response.raise_for_status()
+            if response.status_code >= 500 and attempt < attempts:
+                time.sleep(min(10.0, GOOGLE_SHEET_RETRY_BASE_SECONDS * (2 ** (attempt - 1))) + random.random())
+                continue
+            response.raise_for_status()
+            return response
+        except (requests.Timeout, requests.ConnectionError):
+            # A mutation may have committed despite a missing response. Quota
+            # metadata must not survive that uncertain write either.
+            if method.upper() != "GET":
+                match = re.search(r"/spreadsheets/([^/:?]+)", url)
+                if match:
+                    _sheet_metadata_cache.pop(match[1], None)
+            if attempt >= attempts:
+                raise
+            time.sleep(min(10.0, GOOGLE_SHEET_RETRY_BASE_SECONDS * (2 ** (attempt - 1))) + random.random())
+    raise RuntimeError(f"{operation} failed")
+
+
+def _sheet_values(spreadsheet_id, range_name):
+    if not GOOGLE_CREDENTIALS.valid:
+        GOOGLE_CREDENTIALS.refresh(GoogleAuthRequest())
+    headers = {"Authorization": f"Bearer {GOOGLE_CREDENTIALS.token}"}
+    # A1 range 可能包含 /、空白、中文等字元，因此整段做 URL encode。
+    encoded_range = quote(range_name, safe="")
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
+        f"{encoded_range}"
+    )
+    response = _google_request("GET", url, headers=headers, timeout=15, operation=f"READ {range_name}")
+    if response.status_code != 200:
+        app.logger.error("訂單 Google Sheets API 錯誤 %s：%s", response.status_code, response.text)
+    response.raise_for_status()
+    return response.json().get("values", [])
+
+
+
+
+def _sheet_rows(spreadsheet_id, tab_name, first_col, last_col, start_row=2,
+                selected_columns=None):
+    """Read all populated rows in fixed pages, including gaps; never truncate history.
+
+    Sheets omits trailing empty rows in each response. Only grid rowCount is a
+    safe termination condition because a later page can contain more records.
+    """
+    titles = _sheet_metadata(spreadsheet_id).get("sheets", [])
+    props = next((s["properties"] for s in titles
+                  if s.get("properties", {}).get("title") == tab_name), None)
+    if props is None:
+        raise RuntimeError(f"Google Sheet tab not found: {tab_name}")
+    row_count = props.get("gridProperties", {}).get("rowCount")
+    if row_count is None:
+        raise RuntimeError(f"Missing grid rowCount for: {tab_name}")
+    escaped_tab = tab_name.replace("'", "''")
+    page_size = 5000 if selected_columns else 500
+    for first in range(start_row, row_count + 1, page_size):
+        last = min(first + page_size - 1, row_count)
+        if selected_columns:
+            # Dedupe needs only event ID and status, never raw message text.
+            ranges = [f"'{escaped_tab}'!{col}{first}:{col}{last}"
+                      for col in selected_columns]
+            url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values:batchGet"
+            response = _google_request(
+                "GET", url, headers=_google_headers(), timeout=15,
+                params={"ranges": ranges, "fields": "valueRanges(values)"},
+                operation="READ selected history columns",
+            )
+            columns = response.json().get("valueRanges", [])
+            if len(columns) != len(selected_columns):
+                raise RuntimeError("Unexpected Google Sheets batchGet response")
+            yield from zip_longest(
+                *([r[0] if r else "" for r in col.get("values", [])]
+                  for col in columns), fillvalue=""
+            )
+            continue
+        yield from _sheet_values(
+            spreadsheet_id, f"'{escaped_tab}'!{first_col}{first}:{last_col}{last}"
+        )
+
+
+def _google_headers():
+    if not GOOGLE_CREDENTIALS.valid:
+        GOOGLE_CREDENTIALS.refresh(GoogleAuthRequest())
+    return {
+        "Authorization": f"Bearer {GOOGLE_CREDENTIALS.token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+
+
+def _sheet_metadata(spreadsheet_id):
+    cached = _sheet_metadata_cache.get(spreadsheet_id)
+    if cached and time.monotonic() - cached[0] < 300:
+        return cached[1]
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}?fields=sheets.properties"
+    response = _google_request("GET", url, headers=_google_headers(), timeout=15, operation="SHEET METADATA")
+    metadata = response.json()
+    _sheet_metadata_cache[spreadsheet_id] = (time.monotonic(), metadata)
+    return metadata
+
+
+def _ensure_sheet_tab(spreadsheet_id, tab_name, headers):
+    """不存在就自動建立分頁；空白分頁則自動補表頭。"""
+    meta = _sheet_metadata(spreadsheet_id)
+    titles = {
+        s.get("properties", {}).get("title", "")
+        for s in meta.get("sheets", [])
+    }
+    if tab_name not in titles:
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate"
+        payload = {"requests": [{"addSheet": {"properties": {"title": tab_name}}}]}
+        response = _google_request("POST", url, headers=_google_headers(), json=payload, timeout=15, operation=f"ADD TAB {tab_name}")
+        response.raise_for_status()
+
+    existing = _sheet_values(spreadsheet_id, f"'{tab_name}'!A1:Z1")
+    if not existing:
+        encoded_range = quote(f"'{tab_name}'!A1", safe="")
+        url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
+            f"{encoded_range}?valueInputOption=RAW"
+        )
+        response = _google_request(
+            "PUT", url,
+            headers=_google_headers(),
+            json={"range": f"'{tab_name}'!A1", "majorDimension": "ROWS", "values": [headers]},
+            timeout=15, operation=f"WRITE HEADER {tab_name}",
+        )
+        response.raise_for_status()
+
+    return existing or [headers]
+
+
+def _sheet_append(spreadsheet_id, tab_name, values):
+    if _order_write_batch is not None:
+        if spreadsheet_id != BOT_RECORD_SHEET_ID:
+            raise RuntimeError("可靠訂單寫入必須與收件匣在同一份試算表")
+        _order_write_batch.append((tab_name, list(values)))
+        return
+
+    encoded_range = quote(f"'{tab_name}'!A:Z", safe="")
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
+        f"{encoded_range}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS"
+    )
+    response = _google_request(
+        "POST", url,
+        headers=_google_headers(),
+        json={"majorDimension": "ROWS", "values": [values]},
+        timeout=15, operation=f"APPEND {tab_name}",
+    )
+    if response.status_code >= 300:
+        app.logger.error("Bot紀錄 Google Sheets 寫入失敗 %s：%s", response.status_code, response.text)
+    response.raise_for_status()
+
+
+def _sheet_clear(spreadsheet_id, range_name):
+    encoded_range = quote(range_name, safe="")
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
+        f"{encoded_range}:clear"
+    )
+    response = _google_request("POST", url, headers=_google_headers(), json={}, timeout=15, operation=f"CLEAR {range_name}")
+    response.raise_for_status()
+
+
+def _sheet_write_rows(spreadsheet_id, start_range, rows):
+    if not rows:
+        return
+    encoded_range = quote(start_range, safe="")
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/"
+        f"{encoded_range}?valueInputOption=RAW"
+    )
+    response = _google_request(
+        "PUT", url, headers=_google_headers(),
+        json={"majorDimension": "ROWS", "values": rows}, timeout=15, operation=f"WRITE {start_range}",
+    )
+    response.raise_for_status()
+
+
+def _parse_record_time(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(text, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ZoneInfo("Asia/Taipei"))
+            return dt.astimezone(ZoneInfo("Asia/Taipei"))
+        except ValueError:
+            pass
+    return None
+
+
+RAW_EVENT_HEADERS = [
+    "received_at", "event_id", "is_redelivery", "source_type", "group_id",
+    "user_id", "message_type", "text", "status", "detail",
+]
+
+
+def _raw_event_log(event, text, status, detail=""):
+    """Append-only audit trail. Failure is logged but never masks the main handler error."""
+    if not BOT_RAW_EVENT_LOG_ENABLED or not BOT_RECORD_SHEET_ID:
+        return
+    try:
+        _sheet_append(
+            BOT_RECORD_SHEET_ID,
+            BOT_RAW_EVENT_TAB,
+            [
+                _taipei_now_iso(), _line_event_id(event), str(_line_is_redelivery(event)),
+                _line_source_type(event), _line_group_id(event), _line_user_id(event),
+                "text", str(text or "")[:4000], status, str(detail or "")[:1000],
+            ],
+        )
+    except Exception as exc:
+        app.logger.exception("[RAW LOG ERROR] event=%s status=%s error=%r", _line_event_id(event), status, exc)
+
+
+def _load_processed_webhook_event_ids():
+    """Load successfully processed LINE webhook IDs so redelivery is idempotent across Render restarts."""
+    global _processed_webhook_event_ids
+    if not BOT_RAW_EVENT_LOG_ENABLED or not BOT_RECORD_SHEET_ID:
+        _processed_webhook_event_ids = set()
+        return
+    try:
+        rows = _sheet_rows(BOT_RECORD_SHEET_ID, BOT_RAW_EVENT_TAB, "B", "I",
+                           selected_columns=("B", "I"))
+        done = set()
+        for row in rows:
+            event_id = str(row[0] or "").strip()
+            status = str(row[1] or "").strip().upper()
+            if event_id and status == "PROCESSED":
+                done.add(event_id)
+        _processed_webhook_event_ids = done
+        app.logger.info("[WEBHOOK DEDUPE] loaded_processed_event_ids=%s", len(done))
+    except Exception as exc:
+        app.logger.exception("[WEBHOOK DEDUPE ERROR] load failed: %r", exc)
+        _processed_webhook_event_ids = set()
+
+
+class GoogleSheetEventStore:
+    HEADERS = [
+        "order_id", "event_type", "at", "driver_name", "plate",
+        "note", "instance_key", "changes_json",
+    ]
+
+    def __init__(self, spreadsheet_id, tab_name):
+        self.spreadsheet_id = spreadsheet_id
+        self.tab_name = tab_name
+        self.events = []
+        self._events_by_order = {}
+        _ensure_sheet_tab(spreadsheet_id, tab_name, self.HEADERS)
+        self.load()
+
+    def _rebuild_index(self):
+        index = {}
+        for event in self.events:
+            index.setdefault(event.order_id.upper(), []).append(event)
+        for bucket in index.values():
+            bucket.sort(key=lambda e: e.at)
+        self._events_by_order = index
+
+    def load(self):
+        rows = _sheet_rows(self.spreadsheet_id, self.tab_name, "A", "H")
+        events = []
+        for row in rows:
+            row = list(row) + [""] * (8 - len(row))
+            if not str(row[0]).strip():
+                continue
+            try:
+                changes = json.loads(row[7]) if str(row[7]).strip() else {}
+                if not isinstance(changes, dict):
+                    changes = {}
+            except Exception:
+                changes = {}
+            events.append(Event(
+                order_id=str(row[0]).strip(),
+                event_type=str(row[1]).strip(),
+                at=str(row[2]).strip(),
+                driver_name=str(row[3]).strip(),
+                plate=str(row[4]).strip(),
+                note=str(row[5]),
+                instance_key=str(row[6]).strip(),
+                changes=changes,
+            ))
+        self.events = events
+        self._rebuild_index()
+        app.logger.info("[EVENT INDEX] events=%s orders=%s", len(self.events), len(self._events_by_order))
+
+    def add(self, event):
+        app.logger.info("[EVENT WRITE] order_id=%s type=%s at=%s", event.order_id, event.event_type, event.at)
+        _sheet_append(
+            self.spreadsheet_id,
+            self.tab_name,
+            [
+                event.order_id, event.event_type, event.at, event.driver_name,
+                event.plate, event.note, event.instance_key,
+                json.dumps(event.changes or {}, ensure_ascii=False, separators=(",", ":")),
+            ],
+        )
+        self.events.append(event)
+        bucket = self._events_by_order.setdefault(event.order_id.upper(), [])
+        bucket.append(event)
+        bucket.sort(key=lambda e: e.at)
+        app.logger.info("[EVENT OK] order_id=%s type=%s", event.order_id, event.event_type)
+
+    def cleanup_older_than(self, cutoff):
+        kept = []
+        for event in self.events:
+            dt = _parse_record_time(event.at)
+            # 無法辨識日期的舊資料保留，避免誤刪。
+            if dt is None or dt >= cutoff:
+                kept.append(event)
+        if len(kept) == len(self.events):
+            return 0
+        rows = [[
+            e.order_id, e.event_type, e.at, e.driver_name, e.plate, e.note,
+            e.instance_key, json.dumps(e.changes or {}, ensure_ascii=False, separators=(",", ":")),
+        ] for e in kept]
+        _sheet_clear(self.spreadsheet_id, f"'{self.tab_name}'!A2:H")
+        _sheet_write_rows(self.spreadsheet_id, f"'{self.tab_name}'!A2", rows)
+        removed = len(self.events) - len(kept)
+        self.events = kept
+        self._rebuild_index()
+        return removed
+
+    def for_order(self, order):
+        # V1.6.17G: indexed lookup. The old implementation scanned the entire
+        # event list for every order, which made large summary requests hit
+        # Gunicorn's worker timeout.
+        bucket = self._events_by_order.get(order.order_id.upper(), [])
+        if not order.instance_key:
+            return list(bucket)
+        return [
+            event for event in bucket
+            if not event.instance_key or event.instance_key == order.instance_key
+        ]
+
+
+class GoogleSheetLineOrderStore:
+    HEADERS = ["order_id", "updated_at", "mode", "order_json"]
+
+    def __init__(self, spreadsheet_id, tab_name):
+        self.spreadsheet_id = spreadsheet_id
+        self.tab_name = tab_name
+        self.records = {}
+        _ensure_sheet_tab(spreadsheet_id, tab_name, self.HEADERS)
+        self.load()
+
+    def load(self):
+        rows = _sheet_rows(self.spreadsheet_id, self.tab_name, "A", "D")
+        records = {}
+        from order_summary_v1 import Order, LineOrderRecord
+        for row in rows:
+            row = list(row) + [""] * (4 - len(row))
+            oid = str(row[0]).strip().upper()
+            if not oid or not str(row[3]).strip():
+                continue
+            try:
+                payload = json.loads(row[3])
+                order = Order(**payload)
+                # V1.6.17: reparse persisted LINE records with the current parser.
+                # This repairs historical rows after parser improvements (e.g. 10;45 / 10；45)
+                # without requiring the user to repost the order.
+                if getattr(order, "raw_text", ""):
+                    repaired = parse_line_order_text(order.raw_text)
+                    if repaired:
+                        for attr in ("date", "trip_type", "time", "pax", "pickup", "dropoff",
+                                     "district_text", "vehicle_tag", "extra_tags", "flight", "notes"):
+                            setattr(order, attr, getattr(repaired, attr))
+                rec = LineOrderRecord(
+                    order=order,
+                    updated_at=str(row[1]).strip(),
+                    mode=str(row[2]).strip() or "line_added",
+                )
+                # append-only：同一訂單號以最後一列為最新版
+                records[oid] = rec
+            except Exception as exc:
+                app.logger.warning("略過無法解析的 LINE訂單 永久紀錄 %s：%s", oid, exc)
+        self.records = records
+
+    def get(self, order_id):
+        return self.records.get((order_id or "").upper())
+
+    def upsert(self, order, updated_at, mode="line_added"):
+        from dataclasses import asdict
+        app.logger.info("[ORDER WRITE] order_id=%s mode=%s at=%s", order.order_id, mode, updated_at)
+        from order_summary_v1 import LineOrderRecord
+        payload = json.dumps(asdict(order), ensure_ascii=False, separators=(",", ":"))
+        _sheet_append(
+            self.spreadsheet_id,
+            self.tab_name,
+            [order.order_id, updated_at, mode, payload],
+        )
+        self.records[order.order_id.upper()] = LineOrderRecord(
+            order=order, updated_at=updated_at, mode=mode
+        )
+        app.logger.info("[ORDER OK] order_id=%s mode=%s", order.order_id, mode)
+
+    def cleanup_older_than(self, cutoff):
+        rows = _sheet_rows(self.spreadsheet_id, self.tab_name, "A", "D")
+        kept_rows = []
+        total_rows = 0
+        for row in rows:
+            total_rows += 1
+            row = list(row) + [""] * (4 - len(row))
+            dt = _parse_record_time(row[1])
+            if dt is None or dt >= cutoff:
+                kept_rows.append(row[:4])
+        if len(kept_rows) == total_rows:
+            return 0
+        _sheet_clear(self.spreadsheet_id, f"'{self.tab_name}'!A2:D")
+        _sheet_write_rows(self.spreadsheet_id, f"'{self.tab_name}'!A2", kept_rows)
+        removed = total_rows - len(kept_rows)
+        self.load()
+        return removed
+
+    def all_orders(self):
+        return [rec.order for rec in self.records.values()]
+
+
+def _cleanup_google_sheet_records(force=False):
+    # Reliability release: never clear-and-rewrite live ledgers automatically.
+    # An interruption could lose records. Retention now requires planned archiving.
+    return
+
+
+def _init_google_sheet_persistence():
+    global order_event_store, line_order_store
+    if not BOT_RECORD_SHEET_ID:
+        raise RuntimeError("尚未設定 BOT_RECORD_SHEET_ID")
+    order_event_store = GoogleSheetEventStore(BOT_RECORD_SHEET_ID, BOT_EVENT_TAB)
+    line_order_store = GoogleSheetLineOrderStore(BOT_RECORD_SHEET_ID, BOT_LINE_ORDER_TAB)
+    if BOT_RAW_EVENT_LOG_ENABLED:
+        _ensure_sheet_tab(BOT_RECORD_SHEET_ID, BOT_RAW_EVENT_TAB, RAW_EVENT_HEADERS)
+        _load_processed_webhook_event_ids()
+    app.logger.info(
+        "V1.6.10 Bot永久紀錄已啟用：sheet=%s event_tab=%s line_tab=%s events=%s line_orders=%s",
+        BOT_RECORD_SHEET_ID, BOT_EVENT_TAB, BOT_LINE_ORDER_TAB,
+        len(order_event_store.events), len(line_order_store.records),
+    )
+    _cleanup_google_sheet_records(force=True)
+
+
+def _resolve_order_sheet_date(date_text):
+    """支援 M/D 與 YYYY/M/D；未填年份時使用台北目前年份。"""
+    full = re.search(r"(?<!\d)(20\d{2})\s*/\s*(\d{1,2})\s*/\s*(\d{1,2})(?!\d)", date_text)
+    if full:
+        return int(full.group(1)), int(full.group(2)), int(full.group(3))
+
+    short = re.search(r"(?<!\d)(\d{1,2})\s*/\s*(\d{1,2})(?!\d)", date_text)
+    if not short:
+        raise ValueError("日期格式請輸入 M/D，例如：簡表 8/28；也可輸入 YYYY/M/D")
+
+    year = datetime.now(ZoneInfo("Asia/Taipei")).year
+    return year, int(short.group(1)), int(short.group(2))
+
+
+def load_orders_for_date(date_text):
+    if not ORDER_SHEET_ID:
+        raise RuntimeError("尚未設定 ORDER_SHEET_ID")
+
+    year, month, day = _resolve_order_sheet_date(date_text)
+    tab_name = ORDER_SHEET_TAB_TEMPLATE.format(year=year, month=month, day=day)
+
+    # 分頁名稱含 / 時，A1 notation 必須用單引號包起來，例如：'2026/8月'!A:H
+    range_name = f"'{tab_name}'!A:{ORDER_SHEET_MAX_COL}"
+    app.logger.info("讀取訂單分頁：%s", tab_name)
+    rows = _sheet_values(ORDER_SHEET_ID, range_name)
+    sheet_orders = parse_rows(rows)
+    return merge_sheet_and_line_orders(sheet_orders, line_order_store)
+
+
+def order_history_by_id(order_id):
+    events = [e for e in order_event_store.events if e.order_id.upper() == order_id.upper()]
+    events.sort(key=lambda e: e.at)
+    if not events:
+        return f"{order_id}\n尚無調度／異動紀錄"
+    assigned = 0
+    recalled = 0
+    edited = 0
+    cancelled = False
+    active_driver = ""
+    active_plate = ""
+    for e in events:
+        if e.event_type == "assigned":
+            assigned += 1
+            active_driver, active_plate = e.driver_name, e.plate
+            cancelled = False
+        elif e.event_type in {"recalled", "unassigned"}:
+            recalled += 1
+            active_driver = active_plate = ""
+        elif e.event_type == "edited":
+            edited += 1
+        elif e.event_type == "cancelled":
+            cancelled = True
+            active_driver = active_plate = ""
+        elif e.event_type == "restored":
+            cancelled = False
+    if cancelled:
+        current = "取消"
+    elif active_driver or active_plate:
+        current = "重派・已派" if assigned >= 2 and recalled >= 1 else "已派"
+        if edited:
+            current = "異動・" + current
+    elif edited:
+        current = "異動・未派"
+    else:
+        current = "未派"
+    lines = [
+        f"{order_id}｜目前：{current}",
+        f"異動 {edited} 次／指派 {assigned} 次／拉回 {recalled} 次",
+    ]
+    if active_driver or active_plate:
+        lines.append(f"目前司機：{active_driver} {active_plate}".rstrip())
+    lines.append("")
+    for e in events:
+        detail = " ".join(x for x in [e.driver_name, e.plate, e.note] if x)
+        lines.append(f"{e.at}｜{e.event_type}{('｜' + detail) if detail else ''}")
+    return "\n".join(lines)
+
+
+def _split_line_text(text, max_chars=4800):
+    """依換行切 LINE 長文字，避免直接截斷造成訂單看起來像漏抓。"""
+    text = str(text or "")
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    current = []
+    current_len = 0
+    for line in text.splitlines():
+        add_len = len(line) + (1 if current else 0)
+        if current and current_len + add_len > max_chars:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = len(line)
+        elif len(line) > max_chars:
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                current_len = 0
+            for start in range(0, len(line), max_chars):
+                chunks.append(line[start:start + max_chars])
+        else:
+            current.append(line)
+            current_len += add_len
+    if current:
+        chunks.append("\n".join(current))
+    return [c for c in chunks if c]
+
+
+def _line_source_target_id(event):
+    """取得群組 / 聊天室 / 個人 push target。"""
+    source = getattr(event, "source", None)
+    if source is None:
+        return ""
+    return (
+        getattr(source, "group_id", "")
+        or getattr(source, "room_id", "")
+        or getattr(source, "user_id", "")
+        or ""
+    )
+
+
+
+def _events_for_order_id(order_id):
+    return sorted(
+        [e for e in order_event_store.events if e.order_id.upper() == order_id.upper()],
+        key=lambda e: e.at,
+    )
+
+
+def _latest_event(order_id, event_type=None):
+    events = _events_for_order_id(order_id)
+    if event_type:
+        events = [e for e in events if e.event_type == event_type]
+    return events[-1] if events else None
+
+
+def _add_event(event_obj):
+    # Receipt event IDs, rather than same-minute text, govern duplicate handling.
+    order_event_store.add(event_obj)
+
+
+def _sheet_orders_only_for_date(date_text):
+    if not ORDER_SHEET_ID:
+        return []
+    year, month, day = _resolve_order_sheet_date(date_text)
+    tab_name = ORDER_SHEET_TAB_TEMPLATE.format(year=year, month=month, day=day)
+    range_name = f"'{tab_name}'!A:{ORDER_SHEET_MAX_COL}"
+    rows = _sheet_values(ORDER_SHEET_ID, range_name)
+    return parse_rows(rows)
+
+
+def capture_line_activity(event, text):
+    """Capture full LINE orders and standardized order events.
+
+    V1.6.10: only the configured 包車群 / 測試群 may mutate order state.
+    Returns True for standalone event messages so they do not fall through to
+    unrelated blacklist matching.
+    """
+    if not _is_authorized_order_source(event):
+        return False
+    try:
+        _cleanup_google_sheet_records()
+    except Exception as exc:
+        app.logger.warning("60天紀錄清理失敗（不影響本次訊息）：%s", exc)
+    now = _order_event_time(event)
+    full_order = parse_line_order_text(text)
+    oid_match = re.search(r"\b(?:\d{2}KK\d{9}|ORD\d{10}|[A-Z]{3}\d{6}|[A-Z]{2}\d{2}[A-Z]\d{4})\b", text, re.I)
+    oid = full_order.order_id if full_order else (oid_match.group(0).upper() if oid_match else "")
+    alias_event = detect_line_event_alias(text)
+    detected_driver_name, detected_plate = extract_driver_info(text)
+
+    if full_order:
+        app.logger.info(
+            "[ORDER PARSED] event=%s redelivery=%s order_id=%s date=%s time=%s",
+            _line_event_id(event), _line_is_redelivery(event), full_order.order_id, full_order.date, full_order.time,
+        )
+        existing_line = line_order_store.get(full_order.order_id)
+        try:
+            sheet_orders = _sheet_orders_only_for_date(full_order.date)
+        except Exception:
+            # Unknown source data must not be treated as an empty source sheet.
+            raise
+
+        sheet_same_id = [o for o in sheet_orders if o.order_id.upper() == full_order.order_id.upper()]
+        reference = existing_line.order if existing_line else (sheet_same_id[0] if len(sheet_same_id) == 1 else None)
+
+        explicit_edit = alias_event == "edited"
+        latest_any = _latest_event(full_order.order_id)
+        pending_edit = bool(
+            latest_any
+            and latest_any.event_type == "edited"
+            and (not existing_line or latest_any.at >= existing_line.updated_at)
+        )
+
+        conflict = False
+        if len(sheet_same_id) > 1 and not existing_line:
+            conflict = True
+        elif reference and not orders_core_equal(reference, full_order) and not (explicit_edit or pending_edit):
+            conflict = True
+
+        if conflict:
+            _add_event(Event(
+                order_id=full_order.order_id,
+                event_type="conflict",
+                at=now,
+                note="同訂單編號但核心內容不同；未偵測到可接受的訂單修正",
+            ))
+        else:
+            if existing_line:
+                mode = "override" if (explicit_edit or pending_edit or not orders_core_equal(existing_line.order, full_order)) else existing_line.mode
+                line_order_store.upsert(full_order, now, mode=mode)
+            elif not sheet_same_id:
+                line_order_store.upsert(full_order, now, mode="line_added")
+            elif explicit_edit or pending_edit:
+                line_order_store.upsert(full_order, now, mode="override")
+
+            if any(e.event_type == "conflict" for e in _events_for_order_id(full_order.order_id)):
+                _add_event(Event(
+                    order_id=full_order.order_id,
+                    event_type="conflict_resolved",
+                    at=now,
+                    note="已收到可接受的最新版完整訂單",
+                ))
+
+            if explicit_edit:
+                _add_event(Event(
+                    order_id=full_order.order_id,
+                    event_type="edited",
+                    at=now,
+                    note="LINE 完整訂單修正",
+                ))
+
+        # 取消／拉回／改司機 may be posted together with the full order.
+        if alias_event in {"cancelled", "recalled", "driver_change"}:
+            _add_event(Event(
+                order_id=full_order.order_id,
+                event_type=alias_event,
+                at=now,
+                note=text[:500],
+            ))
+
+        driver_name, plate = detected_driver_name, detected_plate
+        if driver_name or plate:
+            events = _events_for_order_id(full_order.order_id)
+            active_name = ""
+            active_plate = ""
+            assigned = False
+            for e in events:
+                if e.event_type == "assigned":
+                    assigned = True
+                    active_name, active_plate = e.driver_name, e.plate
+                elif e.event_type in {"recalled", "unassigned", "driver_change", "cancelled"}:
+                    assigned = False
+                    active_name = active_plate = ""
+
+            same_driver = assigned and (
+                (not driver_name or not active_name or driver_name == active_name)
+                and (not plate or not active_plate or plate == active_plate)
+            )
+            if not same_driver:
+                _add_event(Event(
+                    order_id=full_order.order_id,
+                    event_type="assigned",
+                    at=now,
+                    driver_name=driver_name,
+                    plate=plate,
+                    note="由完整訂單下方司機資料自動辨識",
+                ))
+        try:
+            _record_bot_usage(
+                event,
+                "LINE完整訂單/派車資料" if (driver_name or plate) else "LINE完整訂單"
+            )
+        except Exception:
+            pass
+        return False
+
+    if alias_event and oid:
+        _add_event(Event(
+            order_id=oid,
+            event_type=alias_event,
+            at=now,
+            note=text[:500],
+        ))
+
+        # V1.6.6：「訂單號 + 新司機資料 + 換司機」代表換司機後已重新派出，
+        # 不可以停在「改司機・未派」。
+        if detected_driver_name or detected_plate:
+            _add_event(Event(
+                order_id=oid,
+                event_type="assigned",
+                at=now,
+                driver_name=detected_driver_name,
+                plate=detected_plate,
+                note="由訂單號＋司機資料自動辨識為已派",
+            ))
+
+        try:
+            alias_label = {
+                "cancelled": "訂單取消",
+                "recalled": "拉回/改派",
+                "driver_change": "改司機",
+                "edited": "訂單修正",
+            }.get(alias_event, "訂單異動")
+            _record_bot_usage(event, alias_label)
+        except Exception:
+            pass
+        return True
+
+    # V1.6.6：像「MKJ423828 + 姓名/車號」這種沒有重貼完整訂單的派車格式，
+    # 只要有有效訂單號與司機資料，也直接記成已派。
+    if oid and (detected_driver_name or detected_plate):
+        _add_event(Event(
+            order_id=oid,
+            event_type="assigned",
+            at=now,
+            driver_name=detected_driver_name,
+            plate=detected_plate,
+            note="由訂單號＋司機資料自動辨識為已派",
+        ))
+        try:
+            _record_bot_usage(event, "訂單號＋司機資料派車")
+        except Exception:
+            pass
+        return True
+
+    return False
+
+def _refresh_order_state_from_sheet():
+    """V1.6.11：查簡表前重新從永久 Google Sheet 載入最新狀態。
+
+    Render/Gunicorn 可能有不同 worker，各 worker 的記憶體快取不一定同步。
+    以 Google Sheet 為唯一真實來源，避免已派訂單仍被舊 worker 列成未派。
+    """
+    if hasattr(order_event_store, "load"):
+        order_event_store.load()
+    if hasattr(line_order_store, "load"):
+        line_order_store.load()
+
+
+def handle_order_v1_command(event, text):
+    raw_text = text
+    command_text = _strip_summary_password(raw_text)
+    is_summary_like = bool(re.match(r"^(?:簡表|未派)(?:\s|$)", str(raw_text or "")))
+    if is_summary_like:
+        app.logger.info(
+            "[SUMMARY CMD] received raw=%r stripped=%r",
+            str(raw_text or "")[:300], command_text[:300],
+        )
+    cmd = parse_line_command(command_text)
+    if cmd and cmd['command'] == 'event' and not _is_authorized_order_source(event):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="訂單調度僅接受已授權群組。"))
+        return True
+    if not cmd:
+        if is_summary_like:
+            app.logger.warning("[SUMMARY CMD] parse failed stripped=%r", command_text[:300])
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="簡表指令格式錯誤，請輸入：未派 9/11 9353 或 簡表 9/11 9353")
+                )
+                app.logger.info("[SUMMARY CMD] parse-fail reply success")
+                return True
+            except Exception:
+                app.logger.exception("[SUMMARY CMD] parse-fail reply failed")
+                raise
+        return False
+
+    # V1.6.3：簡表改為密碼制，且預設只能私訊 Bot 查詢。
+    if cmd["command"] in {"summary", "summary_unassigned"}:
+        action_name = "未派簡表查詢" if cmd["command"] == "summary_unassigned" else "完整簡表查詢"
+
+        # V1.6.5：群組與私訊都可查簡表，只驗證密碼，不再限制必須私訊。
+        if not _summary_password_ok(raw_text):
+            app.logger.warning("[SUMMARY CMD] password failed command=%s", cmd.get("command"))
+            try:
+                _record_bot_usage(event, action_name, "密碼錯誤")
+            except Exception:
+                pass
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="簡表密碼錯誤。")
+            )
+            return True
+        app.logger.info("[SUMMARY CMD] password ok command=%s date=%r", cmd.get("command"), cmd.get("date"))
+        reliable_orders.drain(limit=3, budget=25)
+        if reliable_orders.report()['pending']:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="收件匣尚有訂單等待處理，暫不產生簡表。請管理員私訊「漏單檢查」或「補處理訂單」。"))
+            return True
+
+        # V1.6.17E：簡表需要讀 Google Sheet，可能超過 LINE reply token 的有效時間。
+        # 先立即用 reply token 回覆查詢中，後續簡表一律改用 push_message 回原聊天來源。
+        try:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="📋 簡表查詢中，資料整理完成後會自動送出。")
+            )
+            app.logger.info("[SUMMARY CMD] ack reply success")
+        except Exception as ack_exc:
+            app.logger.warning("[SUMMARY CMD] ack reply failed: %s", ack_exc)
+
+    try:
+        if cmd["command"] in {"summary", "summary_unassigned"}:
+            target_id = _line_source_target_id(event)
+            if not target_id:
+                raise RuntimeError("無法取得 LINE 回覆目標 ID")
+
+            # V1.6.11：每次查詢前都以永久 Google Sheet 最新資料為準，
+            # 不依賴目前 Render worker 的舊記憶體快取。
+            app.logger.info("[SUMMARY CMD] refreshing order state from Google Sheet")
+            _refresh_order_state_from_sheet()
+            app.logger.info("[SUMMARY CMD] refresh complete")
+            _record_bot_usage(
+                event,
+                "未派簡表查詢" if cmd["command"] == "summary_unassigned" else "完整簡表查詢",
+                "成功",
+            )
+            orders = load_orders_for_date(cmd["date"])
+            app.logger.info("[SUMMARY CMD] orders loaded date=%r count=%s", cmd.get("date"), len(orders))
+            _summary_started = time.monotonic()
+            if cmd["command"] == "summary_unassigned":
+                summary = generate_unassigned_summary(
+                    orders, cmd["date"], order_event_store
+                )
+            else:
+                summary = generate_daily_summary(
+                    orders, cmd["date"], order_event_store,
+                    include_cancelled=True,
+                    show_unassigned=ORDER_SHOW_UNASSIGNED,
+                )
+
+            _summary_elapsed = time.monotonic() - _summary_started
+            inbox_report = reliable_orders.report()
+            if inbox_report['pending'] or inbox_report['counts'].get('REVIEW', 0):
+                summary = (f"⚠️ 收件匣待重試 {inbox_report['pending']} 筆、待人工確認 "
+                           f"{inbox_report['counts'].get('REVIEW', 0)} 筆；本簡表可能尚未包含這些訊息。\n\n" + summary)
+            chunks = _split_line_text(summary, max_chars=4800)
+            app.logger.info("[SUMMARY CMD] generated chars=%s chunks=%s seconds=%.3f", len(summary or ""), len(chunks), _summary_elapsed)
+
+            # V1.6.17E：避免 Invalid reply token，簡表內容全部以 push_message 傳送。
+            for i in range(0, len(chunks), 5):
+                batch = [TextSendMessage(text=chunk) for chunk in chunks[i:i + 5]]
+                app.logger.info(
+                    "[SUMMARY CMD] pushing batch=%s-%s target=%s",
+                    i + 1, min(i + len(batch), len(chunks)), str(target_id)[:24],
+                )
+                line_bot_api.push_message(target_id, batch)
+            app.logger.info("[SUMMARY CMD] push success chunks=%s", len(chunks))
+            return True
+
+        if cmd["command"] == "history":
+            _record_bot_usage(event, "訂單歷史查詢")
+            text_out = order_history_by_id(cmd["order_id"])
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text_out[:5000]))
+            return True
+
+        if cmd["command"] == "event":
+            _record_bot_usage(event, "訂單調度/異動指令")
+            event_obj = Event(
+                order_id=cmd["order_id"],
+                event_type=cmd["event_type"],
+                at=_taipei_now_iso(),
+                driver_name=cmd.get("driver_name", ""),
+                plate=cmd.get("plate", ""),
+                note=cmd.get("note", ""),
+                changes=cmd.get("changes", {}),
+            )
+            order_event_store.add(event_obj)
+            labels = {
+                "assigned": "已派", "recalled": "已拉回", "edited": "已記錄異動",
+                "cancelled": "已取消", "restored": "已恢復", "driver_change": "已記錄改司機",
+            }
+            reply = f"✅ {cmd['order_id']} {labels.get(cmd['event_type'], '已更新')}"
+            if cmd.get("driver_name") or cmd.get("plate"):
+                reply += f"\n司機：{cmd.get('driver_name','')} {cmd.get('plate','')}".rstrip()
+            if cmd.get("note"):
+                reply += f"\n備註：{cmd['note']}"
+            if cmd.get("changes"):
+                display = "、".join(f"{k}={v}" for k, v in cmd["changes"].items())
+                reply += f"\n套用：{display}"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return True
+    except Exception as exc:
+        app.logger.exception("[SUMMARY CMD] failed: %s", exc)
+        # V1.6.17E：簡表已先消耗 reply token，錯誤通知也必須用 push。
+        if cmd.get("command") in {"summary", "summary_unassigned"}:
+            target_id = _line_source_target_id(event)
+            if target_id:
+                try:
+                    line_bot_api.push_message(
+                        target_id,
+                        TextSendMessage(text=f"⚠️ 簡表產生失敗：{exc}")
+                    )
+                except Exception:
+                    app.logger.exception("[SUMMARY CMD] failure push also failed")
+            return True
+
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=f"⚠️ 訂單功能處理失敗：{exc}")
+        )
+        return True
+
+    return False
+
+# 快取 30 秒：修改試算表後，最慢約 30 秒套用；避免每一則 LINE 訊息都打一次 Google API。
+SHEET_CACHE_SECONDS = int(os.environ.get("SHEET_CACHE_SECONDS", "30"))
+_sheet_cache = {"loaded_at": 0.0, "blocked_list": [], "special_notes": []}
+
+blocked_list = []
+special_notes = []
+
+
+def _cell(row, index):
+    if index >= len(row):
+        return ""
+    return str(row[index]).strip()
+
+
+def _enabled(value):
+    return str(value).strip().lower() not in {"false", "0", "no", "off", "停用"}
+
+
+def load_driver_lists(force=False):
+    global blocked_list, special_notes
+
+    now = time.time()
+    if (
+        not force
+        and _sheet_cache["loaded_at"]
+        and now - _sheet_cache["loaded_at"] < SHEET_CACHE_SECONDS
+    ):
+        blocked_list = _sheet_cache["blocked_list"]
+        special_notes = _sheet_cache["special_notes"]
+        return blocked_list, special_notes
+
+    range_name = f"{GOOGLE_SHEET_TAB}!A:J"
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/"
+        f"{range_name}"
+    )
+
+    # 使用 Service Account 取得 OAuth Access Token
+    if not GOOGLE_CREDENTIALS.valid:
+        GOOGLE_CREDENTIALS.refresh(GoogleAuthRequest())
+
+    headers = {
+        "Authorization": f"Bearer {GOOGLE_CREDENTIALS.token}"
+    }
+
+    response = _google_request("GET", url, headers=headers, timeout=10,
+                               operation="READ driver lists")
+
+    if response.status_code != 200:
+        app.logger.error(
+            "Google Sheets API 錯誤 %s：%s",
+            response.status_code,
+            response.text
+        )
+
+    response.raise_for_status()
+    values = response.json().get("values", [])
+
+    if not values:
+        blocked_list = []
+        special_notes = []
+        return blocked_list, special_notes
+
+    headers = [str(x).strip().lower() for x in values[0]]
+    expected = [
+        "type", "name", "plate", "phone", "vehicle",
+        "color", "bank_code", "account", "note", "enabled"
+    ]
+    if headers[:10] != expected:
+        raise RuntimeError(
+            "drivers 工作表欄位不正確。A1:J1 必須是：" + ", ".join(expected)
+        )
+
+    new_blocked = []
+    new_special = []
+
+    for row in values[1:]:
+        row_type = _cell(row, 0).lower()
+        name = _cell(row, 1)
+
+        if not name or not _enabled(_cell(row, 9)):
+            continue
+
+        phone_text = _cell(row, 3)
+        phones = [
+            p.strip() for p in re.split(r"[,，;；/\n]+", phone_text) if p.strip()
+        ]
+
+        item = {
+            "name": name,
+            "plate": _cell(row, 2),
+            "phone": phones,
+            "vehicle": _cell(row, 4),
+            "color": _cell(row, 5),
+            "bank_code": _cell(row, 6),
+            "account": _cell(row, 7),
+            "note": _cell(row, 8),
+        }
+
+        if row_type == "blacklist":
+            new_blocked.append(item)
+        elif row_type == "special":
+            new_special.append(item)
+
+    blocked_list = new_blocked
+    special_notes = new_special
+    _sheet_cache["loaded_at"] = now
+    _sheet_cache["blocked_list"] = new_blocked
+    _sheet_cache["special_notes"] = new_special
+
+    app.logger.info(
+        "Google Sheet loaded: blacklist=%s, special=%s",
+        len(blocked_list),
+        len(special_notes),
+    )
+    return blocked_list, special_notes
+
+
+def display_phone(value):
+    if isinstance(value, list):
+        cleaned = [normalize_phone(v) for v in value if normalize_phone(v)]
+        return "、".join(cleaned) if cleaned else "未提供"
+    normalized = normalize_phone(value)
+    return normalized or "未提供"
+
+
+# =====================================================
+# 資料格式化
+# =====================================================
+
+def normalize_phone(value):
+    """
+    電話格式統一
+
+    0932-395-446
+    0932395446
+    +886932395446
+    886932395446
+
+    最後都轉成：
+
+    0932395446
+    """
+
+    if not value:
+        return ""
+
+    value = str(value).strip()
+
+    # 移除空白、-、括號
+    value = re.sub(r"[\s\-\(\)]", "", value)
+
+    # +886932395446
+    if value.startswith("+886"):
+        value = "0" + value[4:]
+
+    # 886932395446
+    elif value.startswith("8869"):
+        value = "0" + value[3:]
+
+    return value
+
+
+def normalize_plate(value):
+    """
+    車號格式統一
+
+    RFR-9770
+    RFR 9770
+    RFR9770
+
+    都轉成：
+
+    RFR9770
+    """
+
+    if not value:
+        return ""
+
+    return re.sub(
+        r"[^A-Za-z0-9]",
+        "",
+        str(value)
+    ).upper()
+
+
+def normalize_account(value):
+    """
+    匯款帳號只保留數字
+    """
+
+    if not value:
+        return ""
+
+    return re.sub(
+        r"\D",
+        "",
+        str(value)
+    )
+
+
+# =====================================================
+# 回覆黑名單資料
+# =====================================================
+
+def reply_blacklist(event, item, match_type):
+
+    try:
+        _record_bot_usage(event, f"黑名單查詢（{match_type}）")
+    except Exception:
+        pass
+
+    name = item.get("name", "未提供")
+    phone = display_phone(item.get("phone", []))
+    plate = item.get("plate", "")
+    vehicle = item.get("vehicle", "未提供")
+    color = item.get("color", "未提供")
+    bank_code = item.get("bank_code", "")
+    account = item.get("account", "")
+    note = item.get("note", "").strip()
+
+    if not phone:
+        phone = "未提供"
+
+    if not plate:
+        plate = "未提供"
+
+    if not bank_code:
+        bank_code = "未提供"
+
+    if not account:
+        account = "未提供"
+
+    reply_text = (
+        f"🚨🚨 黑名單警告 🚨🚨\n"
+        f"\n"
+        f"匹配方式：{match_type}\n"
+        f"\n"
+        f"駕駛：{name}\n"
+        f"電話：{phone}\n"
+        f"車號：{plate}\n"
+        f"車型：{vehicle}\n"
+        f"顏色：{color}\n"
+        f"銀行代碼：{bank_code}\n"
+        f"匯款帳號：{account}\n"
+    )
+
+    # 有填備註才顯示
+    if note:
+        reply_text += (
+            f"\n"
+            f"📝 黑名單備註：\n"
+            f"{note}\n"
+        )
+
+    reply_text += (
+        f"\n"
+        f"🚨 此司機永久禁派 🚨"
+    )
+
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=reply_text)
+    )
+
+# =====================================================
+# 回覆特殊註記
+# =====================================================
+
+def reply_special_note(event, item, match_type):
+
+    try:
+        _record_bot_usage(event, f"特殊註記查詢（{match_type}）")
+    except Exception:
+        pass
+
+    name = item.get("name", "未提供")
+    phone = display_phone(item.get("phone", []))
+    plate = item.get("plate", "")
+    vehicle = item.get("vehicle", "未提供")
+    color = item.get("color", "未提供")
+    note = item.get(
+        "note",
+        "請留意此司機特殊狀況"
+    )
+
+    if not phone:
+        phone = "未提供"
+
+    if not plate:
+        plate = "未提供"
+
+    reply_text = (
+        f"⚠️⚠️ 司機特殊提醒 ⚠️⚠️\n"
+        f"\n"
+        f"匹配方式：{match_type}\n"
+        f"\n"
+        f"駕駛：{name}\n"
+        f"電話：{phone}\n"
+        f"車號：{plate}\n"
+        f"車型：{vehicle}\n"
+        f"顏色：{color}\n"
+        f"\n"
+        f"📝 特殊註記：\n"
+        f"{note}\n"
+        f"\n"
+        f"⚠️ 此司機並非黑名單\n"
+        f"⚠️ 請派單時留意"
+    )
+
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=reply_text)
+    )
+
+
+# =====================================================
+# 姓名比對
+# 優先順序 ①
+# =====================================================
+
+def check_name(text):
+
+    text_lower = text.lower()
+
+    # -----------------------------
+    # 先檢查黑名單
+    # -----------------------------
+
+    for item in blocked_list:
+
+        name = item.get(
+            "name",
+            ""
+        ).strip()
+
+        if not name:
+            continue
+
+        if name.lower() in text_lower:
+            return "blacklist", item, "姓名"
+
+
+    # -----------------------------
+    # 再檢查特殊註記
+    # -----------------------------
+
+    for item in special_notes:
+
+        name = item.get(
+            "name",
+            ""
+        ).strip()
+
+        if not name:
+            continue
+
+        if name.lower() in text_lower:
+            return "special", item, "姓名"
+
+    return None
+
+
+# =====================================================
+# 車號比對
+# 優先順序 ②
+# =====================================================
+
+def check_plate(text):
+
+    clean_text = normalize_plate(text)
+
+    if not clean_text:
+        return None
+
+    # -----------------------------
+    # 黑名單
+    # -----------------------------
+
+    for item in blocked_list:
+
+        plate = normalize_plate(
+            item.get("plate", "")
+        )
+
+        if not plate:
+            continue
+
+        if plate in clean_text:
+            return "blacklist", item, "車號"
+
+
+    # -----------------------------
+    # 特殊註記
+    # -----------------------------
+
+    for item in special_notes:
+
+        plate = normalize_plate(
+            item.get("plate", "")
+        )
+
+        if not plate:
+            continue
+
+        if plate in clean_text:
+            return "special", item, "車號"
+
+    return None
+
+
+# =====================================================
+# 電話比對
+# 優先順序 ③
+# =====================================================
+def check_phone(text):
+
+    # 抓出訊息中的 8～20 位數字
+    numbers = re.findall(
+        r"\d{8,20}",
+        text
+    )
+
+    normalized_numbers = []
+
+    for number in numbers:
+        normalized = normalize_phone(number)
+
+        if normalized:
+            normalized_numbers.append(normalized)
+
+
+    # =================================================
+    # 黑名單電話比對
+    # =================================================
+
+    for item in blocked_list:
+
+        phones = item.get("phone", [])
+
+        # 如果只有一支電話，轉成 list
+        if isinstance(phones, str):
+            phones = [phones]
+
+        for phone in phones:
+
+            normalized_phone = normalize_phone(phone)
+
+            if normalized_phone in normalized_numbers:
+                return "blacklist", item, "電話"
+
+
+    # =================================================
+    # 特殊註記電話比對
+    # =================================================
+
+    for item in special_notes:
+
+        phones = item.get("phone", [])
+
+        # 如果只有一支電話，轉成 list
+        if isinstance(phones, str):
+            phones = [phones]
+
+        for phone in phones:
+
+            normalized_phone = normalize_phone(phone)
+
+            if normalized_phone in normalized_numbers:
+                return "special", item, "電話"
+
+
+    return None
+    
+# =====================================================
+# 匯款資料比對
+# 優先順序 ④
+# =====================================================
+
+def check_account(text):
+
+    numbers = re.findall(
+        r"\d{8,20}",
+        text
+    )
+
+    # -----------------------------
+    # 黑名單
+    # -----------------------------
+
+    for item in blocked_list:
+
+        account = normalize_account(
+            item.get("account", "")
+        )
+
+        if not account:
+            continue
+
+        for number in numbers:
+
+            if normalize_account(number) == account:
+                return "blacklist", item, "匯款帳號"
+
+
+    # -----------------------------
+    # 特殊註記
+    # -----------------------------
+
+    for item in special_notes:
+
+        account = normalize_account(
+            item.get("account", "")
+        )
+
+        if not account:
+            continue
+
+        for number in numbers:
+
+            if normalize_account(number) == account:
+                return "special", item, "匯款帳號"
+
+    return None
+
+
+# =====================================================
+# 健康檢查（Render / 瀏覽器測試用）
+# =====================================================
+
+# V1.6.9：在開始接收 LINE webhook 前，先從永久 Google Sheet 載入歷史狀態。
+def _log_boot_memory(stage):
+    """Linux peak RSS diagnostics; no extra dependency or background process."""
+    try:
+        import resource
+        peak_mib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        app.logger.warning("[BOOT MEMORY] stage=%s pid=%s peak_rss_mib=%.1f",
+                           stage, os.getpid(), peak_mib)
+    except ImportError:
+        pass  # resource is unavailable on Windows.
+
+
+def _initialize_storage():
+    global reliable_orders
+    try:
+        _log_boot_memory("before-sheet-init")
+        app.logger.warning("[STORAGE INIT] loading order history")
+        _init_google_sheet_persistence()
+        app.logger.warning("[STORAGE INIT] loading inbox index")
+        inbox = ReliableOrders(sys.modules[__name__], BOT_INBOX_TAB)
+        reliable_orders = inbox
+        with _storage_lock:
+            _storage_state.update(ready=True, last_error=None, next_retry=0.0)
+        _log_boot_memory("after-sheet-init")
+        app.logger.warning("[STORAGE READY] orders and inbox ready")
+    except Exception as exc:
+        with _storage_lock:
+            _storage_state.update(ready=False, last_error=type(exc).__name__, next_retry=time.monotonic() + 60)
+        app.logger.exception("[STORAGE NOT READY] retry after cooldown; webhook remains unacknowledged")
+    finally:
+        with _storage_lock:
+            _storage_state["initializing"] = False
+
+
+def _start_storage_init():
+    _ensure_storage_process()
+    with _storage_lock:
+        if _storage_state["ready"] or _storage_state["initializing"]:
+            return
+        if time.monotonic() < _storage_state["next_retry"]:
+            return
+        _storage_state.update(initializing=True, started_at=time.monotonic(),
+                              operation="starting", progress_at=time.monotonic())
+        thread = threading.Thread(target=_initialize_storage, name="sheet-bootstrap", daemon=True)
+        try:
+            thread.start()
+        except Exception:
+            _storage_state["initializing"] = False
+            raise
+
+
+def _reset_storage_process():
+    # A fork must never inherit a parent's readiness, locks, or quota state.
+    global _storage_pid, _storage_lock, _storage_state, _sheets_gate, reliable_orders
+    _storage_pid = os.getpid()
+    _storage_lock = threading.Lock()
+    _storage_state = dict(ready=False, initializing=False, last_error=None,
+                          next_retry=0.0, started_at=None, operation="idle", progress_at=None)
+    _sheets_gate = QuotaGate()
+    _sheet_metadata_cache.clear()
+    reliable_orders = None
+
+
+def _ensure_storage_process():
+    if _storage_pid != os.getpid():
+        _reset_storage_process()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_storage_process)
+
+
+def _storage_available():
+    _ensure_storage_process()
+    if not _storage_state["ready"]:
+        _start_storage_init()
+    return _storage_state["ready"]
+
+
+@app.route("/", methods=["GET"])
+def health_check():
+    ready = _storage_available()
+    state = "ready" if ready else "NOT_READY"
+    # Liveness only. Readiness and order acknowledgements are separate.
+    return f"LINE bot web is running | reliable-inbox-v2-worker-init | storage={state} | order parser {PARSER_VERSION}", 200
+
+
+@app.route("/ready", methods=["GET"])
+def storage_readiness():
+    ready = _storage_available()
+    with _storage_lock:
+        state = dict(_storage_state)
+    now = time.monotonic()
+    return {"version": "reliable-inbox-v2-worker-init", "pid": os.getpid(),
+            "ready": ready, "initializing": state["initializing"],
+            "last_error_type": state["last_error"], "operation": state["operation"],
+            "elapsed_seconds": round(now - state["started_at"], 1) if state["started_at"] else 0,
+            "progress_age_seconds": round(now - state["progress_at"], 1) if state["progress_at"] else 0,
+            "retry_in_seconds": max(0, round(state["next_retry"] - now))}, 200 if ready else 503
+
+
+# =====================================================
+# LINE Webhook
+# =====================================================
+
+@app.route("/callback", methods=["POST"])
+def callback():
+
+    # 取得 LINE Signature
+    signature = request.headers.get(
+        "X-Line-Signature"
+    )
+
+    if not signature:
+        abort(400)
+
+
+    # 取得訊息內容
+    body = request.get_data(
+        as_text=True
+    )
+
+    app.logger.info("[WEBHOOK RX] bytes=%s", len(body.encode("utf-8")))
+
+    # LINE 驗證 / 同步處理：只有全部 handler 完成才回 200。
+    # 若 Google Sheet 寫入失敗，讓 request 回 500，避免錯誤被吃掉後仍回 200。
+    try:
+        # Verify before doing initialization work. An empty LINE verification
+        # contains no orders; real messages must wait for durable storage.
+        events = handler.parser.parse(body, signature)
+        if not events:
+            return "OK", 200
+        if not _storage_available():
+            return "STORAGE_NOT_READY", 503, {"Retry-After": "60"}
+        handler.handle(body, signature)
+
+    except SheetsBusy as exc:
+        return "SHEETS_BUSY", 503, {"Retry-After": str(exc.retry_after)}
+
+    except InvalidSignatureError:
+
+        print(
+            "Invalid signature. "
+            "Please check your "
+            "channel access token/channel secret."
+        )
+
+        abort(400)
+
+    except LineBotApiError as exc:
+        # V1.6.17F：reply token 已使用/過期時，不可回 500，否則 LINE redelivery
+        # 會把同一事件再次送進來，形成重複處理循環。
+        msg = str(exc)
+        if "Invalid reply token" in msg:
+            app.logger.warning("[WEBHOOK REPLY TOKEN] invalid token ignored; return 200")
+            return "OK", 200
+        app.logger.exception("[WEBHOOK LINE API ERROR] handler failed: %r", exc)
+        return "ERROR", 500
+
+    except Exception as exc:
+        app.logger.exception("[WEBHOOK ERROR] handler failed: %r", exc)
+        return "ERROR", 500
+
+    app.logger.info("[WEBHOOK OK]")
+    return "OK"
+
+
+# =====================================================
+# 收到 LINE 文字訊息
+# =====================================================
+
+def _handle_message_business(event):
+
+    text = event.message.text.strip()
+    event_id = _line_event_id(event)
+    app.logger.info(
+        "[LINE RX] event=%s redelivery=%s source=%s group=%s user=%s text=%r",
+        event_id or "(none)", _line_is_redelivery(event), _line_source_type(event),
+        _line_group_id(event) or "-", _line_user_id(event) or "-", text[:500],
+    )
+    if event_id and event_id in _processed_webhook_event_ids:
+        app.logger.info("[LINE DUPLICATE] event=%s redelivery=%s skipped=true", event_id, _line_is_redelivery(event))
+        return
+
+    if _is_authorized_order_source(event) and not _reliable_skip_capture:
+        _raw_event_log(event, text, "RECEIVED")
+
+    # 記錄「誰曾經私訊過 Bot」；不保存訊息內容。
+    try:
+        _record_private_interaction(event)
+    except Exception as exc:
+        app.logger.warning("互動紀錄失敗：%s", exc)
+
+    # 查看自己的 LINE User ID / 管理員狀態。
+    if text in {"我的ID", "我的id", "我的 Id", "我的權限", "權限"}:
+        try:
+            _record_bot_usage(event, "我的ID/權限查詢")
+        except Exception:
+            pass
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=_my_line_identity_text(event))
+        )
+        return
+
+    # 只有管理員本人可以查看「誰私訊過 Bot」，且只在私訊中回傳。
+    if text in {"誰私訊過機器人", "誰私訊過Bot", "私訊紀錄", "訊息紀錄"}:
+        if not _is_private_line_chat(event):
+            reply_text = (
+                "私訊紀錄屬機密資料，請私訊 Bot 查詢。"
+                if _line_user_id(event) == SUMMARY_ADMIN_USER_ID
+                else "無權限使用此功能。"
+            )
+        else:
+            reply_text = _interaction_report(event)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        return
+
+    # V1.6.4：私訊＋群組，只記錄真正觸發 Bot 功能的人。
+    # 只有管理員本人，而且必須私訊 Bot 才能查看。
+    if text in {"使用紀錄", "觸發紀錄", "誰使用過機器人", "誰觸發過機器人", "Bot使用紀錄"}:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=_usage_report(event))
+        )
+        return
+
+    try:
+        app.logger.info(
+            "LINE互動 user_id=%s source=%s",
+            _line_user_id(event) or "(unknown)",
+            _line_source_type(event) or "(unknown)",
+        )
+    except Exception:
+        pass
+
+    # V1.6.10：取得目前群組 Group ID。這個指令在尚未設定白名單前也能使用。
+    if text in {"群組ID", "群組id", "Group ID", "group id"}:
+        gid = _line_group_id(event)
+        if gid:
+            reply_text = f"目前群組 Group ID：\n{gid}"
+        else:
+            reply_text = "這裡不是 LINE 群組，請到『包車群』或『測試群』輸入：群組ID"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        return
+
+    # 訂單解析器版本檢查：可在 LINE 輸入「版本」確認 Render 目前實際載入哪一版。
+    if text in {"版本", "訂單版本", "parser version"}:
+        try:
+            _record_bot_usage(event, "版本查詢")
+        except Exception:
+            pass
+        # V1.6.17F：互動指令也要納入 event_id 去重；否則 redelivery 會再次
+        # 使用同一個 reply token，造成 Invalid reply token / callback 500。
+        if event_id:
+            _processed_webhook_event_ids.add(event_id)
+        try:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"訂單解析器：{PARSER_VERSION}\n訂單保護：reliable-inbox-v2-worker-init")
+            )
+        except LineBotApiError as exc:
+            if "Invalid reply token" in str(exc):
+                app.logger.warning("[VERSION CMD] invalid reply token ignored event=%s", event_id or "(none)")
+                return
+            raise
+        return
+
+    # V1.6.17D：簡表/未派指令優先處理。
+    # 避免被訂單擷取、黑名單 Google Sheet 載入或黑名單比對提前 return。
+    if re.match(r"^(?:簡表|未派)(?:\s|$)", text):
+        app.logger.info("[SUMMARY CMD] early route text=%r", text[:300])
+        # V1.6.17F：簡表後續以 push_message 傳送，不需要靠 redelivery 重跑。
+        # 先鎖住 event_id，避免同一事件重送後再次消耗 reply token/重複 push。
+        if event_id:
+            _processed_webhook_event_ids.add(event_id)
+        if handle_order_v1_command(event, text):
+            return
+
+    # V1.6.16：先被動記錄 LINE 完整訂單／取消／拉回／改司機／訂單修正。
+    # 這裡不可吞掉例外：寫 Sheet 失敗必須讓 /callback 回 500，交由 LINE redelivery。
+    try:
+        captured_only = False if _reliable_skip_capture else capture_line_activity(event, text)
+        if _is_authorized_order_source(event) and not _reliable_skip_capture:
+            parsed = parse_line_order_text(text)
+            _raw_event_log(
+                event, text, "PROCESSED",
+                f"order_id={getattr(parsed, 'order_id', '')}" if parsed else "non_full_order",
+            )
+        if event_id:
+            _processed_webhook_event_ids.add(event_id)
+        if captured_only:
+            return
+    except Exception as exc:
+        if _is_authorized_order_source(event):
+            _raw_event_log(event, text, "ERROR", repr(exc))
+        app.logger.exception("[ORDER SAVE FAILED] event=%s error=%r", event_id or "(none)", exc)
+        raise
+
+    # 每則訊息處理前確認 Google Sheet 快取；預設每 30 秒更新一次。
+    try:
+        load_driver_lists()
+    except Exception as exc:
+        app.logger.exception("讀取 Google Sheet 失敗：%s", exc)
+        # 若先前已有成功快取，繼續使用舊資料，避免 Google 暫時異常時 Bot 完全失效。
+        if not blocked_list and not special_notes:
+            return
+
+    if not text:
+        return
+
+
+    # =================================================
+    # ① 姓名
+    # =================================================
+
+    result = check_name(text)
+
+    if result:
+
+        result_type, item, match_type = result
+
+        if result_type == "blacklist":
+
+            reply_blacklist(
+                event,
+                item,
+                match_type
+            )
+
+        else:
+
+            reply_special_note(
+                event,
+                item,
+                match_type
+            )
+
+        return
+
+
+    # =================================================
+    # ② 車號
+    # =================================================
+
+    result = check_plate(text)
+
+    if result:
+
+        result_type, item, match_type = result
+
+        if result_type == "blacklist":
+
+            reply_blacklist(
+                event,
+                item,
+                match_type
+            )
+
+        else:
+
+            reply_special_note(
+                event,
+                item,
+                match_type
+            )
+
+        return
+
+
+    # =================================================
+    # ③ 電話
+    # =================================================
+
+    result = check_phone(text)
+
+    if result:
+
+        result_type, item, match_type = result
+
+        if result_type == "blacklist":
+
+            reply_blacklist(
+                event,
+                item,
+                match_type
+            )
+
+        else:
+
+            reply_special_note(
+                event,
+                item,
+                match_type
+            )
+
+        return
+
+
+    # =================================================
+    # ④ 匯款帳號
+    # =================================================
+
+    result = check_account(text)
+
+    if result:
+
+        result_type, item, match_type = result
+
+        if result_type == "blacklist":
+
+            reply_blacklist(
+                event,
+                item,
+                match_type
+            )
+
+        else:
+
+            reply_special_note(
+                event,
+                item,
+                match_type
+            )
+
+        return
+
+    # =================================================
+    # ⑤ 訂單每日簡表 / 調度事件 V1
+    # 保留原本黑名單與特殊註記優先權，安全檢查通過後才寫入調度事件。
+    # =================================================
+    if handle_order_v1_command(event, text):
+        return
+
+
+
+def _order_event_time(event):
+    stamp = getattr(event, "timestamp", None)
+    if stamp:
+        return datetime.fromtimestamp(int(stamp) / 1000, ZoneInfo("Asia/Taipei")).isoformat(timespec="seconds")
+    return _taipei_now_iso()
+
+
+def _is_informational_command(text):
+    simple = {"我的ID", "我的id", "我的 Id", "我的權限", "權限", "群組ID", "群組id",
+              "Group ID", "group id", "版本", "訂單版本", "parser version",
+              "誰私訊過機器人", "誰私訊過Bot", "私訊紀錄", "訊息紀錄", "使用紀錄",
+              "觸發紀錄", "誰使用過機器人", "誰觸發過機器人", "Bot使用紀錄"}
+    if text in simple or re.match(r"^(?:簡表|未派)(?:\s|$)", text):
+        return True
+    cmd = parse_line_command(text)
+    return bool(cmd and cmd["command"] == "history")
+
+
+def _plan_reliable_order(event):
+    if not _is_authorized_order_source(event):
+        return {"kind": "review", "detail": "來源群組目前未授權，保留待確認"}
+    message = getattr(event, "message", None)
+    if not isinstance(message, TextMessage):
+        return {"kind": "review", "detail": "非文字訊息；已保存事件資訊，附件內容須人工確認"}
+    text = message.text.strip()
+    cmd = parse_line_command(text)
+    if cmd and cmd["command"] == "event":
+        _add_event(Event(order_id=cmd["order_id"], event_type=cmd["event_type"],
+                         at=_order_event_time(event), driver_name=cmd.get("driver_name", ""),
+                         plate=cmd.get("plate", ""), note=cmd.get("note", ""), changes=cmd.get("changes", {})))
+        return {"kind": "saved", "order_id": cmd["order_id"], "captured_only": True,
+                "reply": f"✅ {cmd['order_id']} 調度狀態已保存（{cmd['event_type']}）"}
+    full = parse_line_order_text(text)
+    captured_only = capture_line_activity(event, text)
+    has_conflict = any(tab == BOT_EVENT_TAB and len(values) > 1 and values[1] == "conflict"
+                       for tab, values in _order_write_batch)
+    if has_conflict:
+        return {"kind": "review", "order_id": full.order_id if full else "", "detail": "同編號內容衝突，需人工確認", "captured_only": captured_only}
+    if full or _order_write_batch:
+        written_id = next((str(values[0]) for tab, values in _order_write_batch
+                           if tab in {BOT_EVENT_TAB, BOT_LINE_ORDER_TAB} and values), "")
+        return {"kind": "saved", "order_id": full.order_id if full else written_id,
+                "captured_only": captured_only, "detail": "訂單或調度已保存／確認既有資料"}
+    return {"kind": "review", "detail": "未辨識成完整訂單或調度指令，保留原文待人工確認", "captured_only": False}
+
+
+def _admin_inbox_command(event, text):
+    review_action = re.fullmatch(r"(結案訊息|重試訊息)\s+(\S+)", text)
+    if text not in {"漏單檢查", "補處理訂單"} and not review_action:
+        return False
+    if not SUMMARY_ADMIN_USER_ID or _line_user_id(event) != SUMMARY_ADMIN_USER_ID or not _is_private_line_chat(event):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請由已設定的管理員私訊使用此指令。"))
+        return True
+    if review_action:
+        try:
+            reliable_orders.review_action(review_action[2], _line_user_id(event), retry=review_action[1] == '重試訊息')
+            message = "已排入重新解析。" if review_action[1] == '重試訊息' else "已記錄人工結案；本操作不會新增訂單。"
+        except ValueError as exc:
+            message = str(exc)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=message))
+        return True
+    if text == "補處理訂單":
+        reliable_orders.drain(limit=3, refresh=True)
+    else:
+        reliable_orders.refresh()
+    report = reliable_orders.report()
+    lines = ["訂單收件匣", f"待重試：{report['pending']}",
+             f"待人工確認：{report['counts'].get('REVIEW', 0)}",
+             f"已完成：{report['counts'].get('DONE', 0)}",
+             "待確認事件 ID（最多20筆）：", *report['review_event_ids'],
+             "請到 Google Sheets 的訂單收件匣查看原文與原因。"]
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(lines)[:4800]))
+    return True
+
+
+@app.route("/internal/replay", methods=["POST"])
+def replay_orders():
+    auth = request.headers.get("Authorization", "")
+    if not hmac.compare_digest(auth.encode('utf-8'), ("Bearer " + REPLAY_SECRET).encode('utf-8')):
+        abort(403)
+    if not _storage_available():
+        return {"error": "storage_not_ready"}, 503, {"Retry-After": "60"}
+    try:
+        reliable_orders.drain(limit=3, budget=25, refresh=True)
+        return reliable_orders.report(), 200
+    except Exception:
+        app.logger.exception("[INBOX REPLAY FAILED]")
+        return {"error": "inbox_unavailable"}, 503
+
+
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    global _reliable_skip_capture
+    text = event.message.text.strip()
+    if _admin_inbox_command(event, text):
+        return
+    if not _is_authorized_order_source(event):
+        return _handle_message_business(event)
+    command = _is_informational_command(text)
+    eid, new = reliable_orders.receive(event, command=command)
+    if command:
+        # Queries carry no order writes and must not be replayed with old tokens.
+        if new:
+            if re.match(r"^(?:簡表|未派)(?:\s|$)", text):
+                reliable_orders.drain(limit=3, budget=25)
+                if reliable_orders.report()['pending']:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                        text="收件匣尚有訂單等待處理；請管理員先私訊「補處理訂單」及「漏單檢查」，避免取得尚未完整的簡表。"))
+                    return
+            return _handle_message_business(event)
+        return
+    results = reliable_orders.drain(limit=3, budget=25)
+    result = results.get(eid)
+    if not result:
+        return  # Durable receipt exists. Timer/manual replay will resume it.
+    if result.get("reply"):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result["reply"]))
+        return
+    if result.get("captured_only"):
+        return
+    _reliable_skip_capture = True
+    try:
+        return _handle_message_business(event)
+    finally:
+        _reliable_skip_capture = False
+
+
+@handler.add(MessageEvent)
+def handle_other_message(event):
+    if _is_authorized_order_source(event):
+        reliable_orders.receive(event)
+        reliable_orders.drain(limit=3, budget=25)
+
+
+# =====================================================
+# 啟動 Flask
+# =====================================================
+
+# Initialization starts inside the worker or on its first health request.
+
+if __name__ == "__main__":
+    _start_storage_init()
+    port = int(os.environ.get("PORT", 3000))
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False
+    )
